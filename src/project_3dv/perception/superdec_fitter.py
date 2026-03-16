@@ -1,23 +1,45 @@
 """
 superdec_fitter.py
 ==================
-Drop-in replacement for SuperquadricFitter that uses the pretrained
-SuperDec model for SQ decomposition.
+Drop-in replacement for SuperquadricFitter that uses the fine-tuned SuperDec
+model for SQ decomposition on tabletop objects.
 
-Shares the same fit_adaptive() interface — ocid_eval.py and pipeline.py
-need zero changes beyond swapping the fitter instance.
+Default checkpoint
+------------------
+The default is the fine-tuned tabletop v2 model, which should be located at:
+    ../checkpoints/superdec_tabletop/superdec_tabletop_finetune_v2/
+relative to the superdec_dir.  You can override this via the `checkpoint_dir`
+parameter (absolute path or relative to CWD).  The directory must contain:
+    config.yaml   — Hydra training config (defines model architecture)
+    ckpt.pt       — single checkpoint file, OR
+    epoch_NNN.pt  — epoch-based saves (highest epoch is used automatically)
+
+Base checkpoints (not fine-tuned) live at:
+    {superdec_dir}/checkpoints/{normalized,shapenet}/ckpt.pt
+and can still be used by passing checkpoint_dir explicitly.
+
+Interface contract (compatible with SuperquadricFitter)
+-------------------------------------------------------
+Input:
+    points: (N, 3) float32/float64 numpy array, world coordinates.
+    SuperDec internally samples to 4096 points and normalises to unit sphere
+    (per superdec/data/dataloader.py::normalize_points).
+
+Output:
+    MultiSQFit  — list of up to 16 SuperquadricFit primitives filtered by
+                  existence score, with symmetric Chamfer L2 computed via
+                  surface sampling.  Feeds directly into:
+                    • fits_to_curobo_obstacles()  (collision avoidance)
+                    • Scene.get_signed_distance()  (path planning SDF)
+                    • GraspSelector.grasp_candidates()  (grasp planning)
 
 Usage:
     from superdec_fitter import SuperdecFitter
-    fitter = SuperdecFitter(
-        superdec_dir='/path/to/superdec',
-        checkpoint='normalized',   # or 'shapenet'
-        exist_threshold=0.3,       # primitives below this are discarded
-        device='cuda',             # or 'cpu'
-    )
-    result = fitter.fit_adaptive(points)   # (N,3) float32 np.ndarray
+    fitter = SuperdecFitter(superdec_dir='/path/to/superdec')
+    result = fitter.fit_adaptive(points)   # (N,3) numpy array
 """
 
+import logging
 import os
 import sys
 import numpy as np
@@ -25,6 +47,22 @@ import torch
 from dataclasses import dataclass, field
 from typing import List, Optional
 import scipy.spatial.transform as sst
+
+# ---------------------------------------------------------------------------
+# Superquadric exponent constraints
+# ---------------------------------------------------------------------------
+#: Maximum exponent for the convex SQ regime.  Shapes with e₁ or e₂ > 2 are
+#: non-convex and produce unbounded implicit-function gradients, making them
+#: unsuitable for gradient-based planners or safety filters.  All fitted
+#: primitives are clamped to this value before they leave this module.
+SQ_EXPONENT_CONVEX_MAX: float = 2.0
+
+#: Minimum exponent to avoid numerical instability in sq_implicit() and
+#: sq_radial_distance(), which compute x^(2/e).  Values near zero cause the
+#: exponent 2/e to blow up, producing NaN signed-distance values.
+SQ_EXPONENT_MIN: float = 1e-3
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # lazy import of superdec — path injected at construction time
@@ -42,7 +80,7 @@ def _load_superdec(superdec_dir: str):
 
 # ---------------------------------------------------------------------------
 # reuse SuperquadricFit / MultiSQFit from superquadric.py if available,
-# otherwise define minimal stubs
+# otherwise define minimal stubs matching the canonical interface exactly
 # ---------------------------------------------------------------------------
 try:
     from superquadric import SuperquadricFit, MultiSQFit, sq_type_from_exponents
@@ -65,10 +103,13 @@ except ImportError:
         converged: bool = True
         chamfer_l2: float = 0.0
 
+        def surface_points(self, n_u: int = 50, n_v: int = 50) -> np.ndarray:
+            return np.zeros((0, 3), dtype=np.float32)
+
     @dataclass
     class MultiSQFit:
         primitives: List[SuperquadricFit] = field(default_factory=list)
-        total_chamfer_l2: float = 0.0
+        n_points: int = 0
 
     def sq_type_from_exponents(e1: float, e2: float) -> str:
         if e1 > 0.6 and e2 > 0.6:   return "Ellipsoid"
@@ -84,47 +125,167 @@ def _rotmat_to_euler_xyz(R: np.ndarray) -> tuple:
     return float(rx), float(ry), float(rz)
 
 
-def _chamfer_l2(pts: np.ndarray, sq_fit: 'SuperquadricFit') -> float:
-    """Approximate Chamfer L2 from points to the nearest SQ surface point.
-    Uses the SQ implicit function as a proxy — fast but approximate."""
+def _chamfer_l2_from_surface(pts: np.ndarray, fit: 'SuperquadricFit',
+                              n_u: int = 50, n_v: int = 50) -> float:
+    """Symmetric Chamfer L2 between input points and sampled SQ surface.
+
+    Uses SuperquadricFit.surface_points(n_u, n_v) which is available on
+    both the canonical class and the stub above.
+
+    Parameters
+    ----------
+    n_u, n_v : int
+        Surface sampling grid resolution (see surface_points() docstring).
+        Default 50×50 = 2 500 surface points.
+    """
     try:
-        from superquadric import sq_surface_points
-        surf = sq_surface_points(sq_fit, n=512)
+        surf = fit.surface_points(n_u=n_u, n_v=n_v)
         if surf is None or len(surf) == 0:
             return 0.0
-        # one-sided: mean squared distance from pts to nearest surface point
-        diff = pts[:, None, :] - surf[None, :, :]
-        dists = (diff ** 2).sum(-1).min(-1)
-        return float(dists.mean())
+        pts32 = pts.astype(np.float32)
+        surf32 = surf.astype(np.float32)
+        # points → surface
+        diff_ps = pts32[:, None, :] - surf32[None, :, :]
+        d_ps = (diff_ps ** 2).sum(-1).min(-1)
+        # surface → points
+        diff_sp = surf32[:, None, :] - pts32[None, :, :]
+        d_sp = (diff_sp ** 2).sum(-1).min(-1)
+        return float(d_ps.mean() + d_sp.mean())
     except Exception:
         return 0.0
 
 
-class SuperdecFitter:
+def _clamp_exponents(primitives: list) -> list:
+    """Clamp e1 and e2 of every SuperquadricFit to the convex regime in-place.
+
+    Ensures SQ_EXPONENT_MIN ≤ e1, e2 ≤ SQ_EXPONENT_CONVEX_MAX for all
+    primitives.  Emits a single warning log if any clamping was needed so
+    that callers know the raw network output was out of range.
+
+    Parameters
+    ----------
+    primitives : list[SuperquadricFit]
+        Modified in-place.
+
+    Returns
+    -------
+    The same list (for call-chaining convenience).
     """
-    SuperDec-based superquadric fitter.
+    clamped = False
+    for fit in primitives:
+        e1_orig, e2_orig = fit.e1, fit.e2
+        fit.e1 = float(np.clip(fit.e1, SQ_EXPONENT_MIN, SQ_EXPONENT_CONVEX_MAX))
+        fit.e2 = float(np.clip(fit.e2, SQ_EXPONENT_MIN, SQ_EXPONENT_CONVEX_MAX))
+        if fit.e1 != e1_orig or fit.e2 != e2_orig:
+            clamped = True
+    if clamped:
+        _log.warning(
+            "SuperdecFitter: one or more primitives had exponents outside "
+            "[%.4g, %.4g]; clamped to convex regime.",
+            SQ_EXPONENT_MIN, SQ_EXPONENT_CONVEX_MAX,
+        )
+    return primitives
+
+
+def _resolve_checkpoint_dir(superdec_dir: str, checkpoint_dir: Optional[str]) -> str:
+    """Return the absolute path to a checkpoint directory.
+
+    Resolution order:
+      1. If checkpoint_dir is an absolute path, use it directly.
+      2. If checkpoint_dir is a relative path, resolve from CWD.
+      3. If checkpoint_dir is None, fall back to the default fine-tuned
+         tabletop v2 checkpoint at
+         ../checkpoints/superdec_tabletop/superdec_tabletop_finetune_v2
+         (relative to superdec_dir).
+    """
+    if checkpoint_dir is not None:
+        p = os.path.abspath(checkpoint_dir)
+        if not os.path.isdir(p):
+            raise FileNotFoundError(f"Checkpoint directory not found: {p}")
+        return p
+
+    # default: fine-tuned tabletop v2 checkpoint
+    default = os.path.abspath(
+        os.path.join(superdec_dir, '..', 'checkpoints',
+                     'superdec_tabletop', 'superdec_tabletop_finetune_v2')
+    )
+    if os.path.isdir(default):
+        return default
+
+    # graceful fallback to base 'normalized' checkpoint bundled with superdec
+    fallback = os.path.join(superdec_dir, 'checkpoints', 'normalized')
+    if os.path.isdir(fallback):
+        import warnings
+        warnings.warn(
+            f"Fine-tuned tabletop checkpoint not found at {default}. "
+            f"Falling back to base 'normalized' checkpoint at {fallback}. "
+            "For best tabletop performance use the fine-tuned model.",
+            stacklevel=3,
+        )
+        return fallback
+
+    raise FileNotFoundError(
+        f"No checkpoint found at {default} or {fallback}. "
+        "Pass checkpoint_dir= explicitly to specify the checkpoint path."
+    )
+
+
+def _find_checkpoint_file(checkpoint_dir: str) -> str:
+    """Return path to the .pt checkpoint file inside checkpoint_dir.
+
+    Supports both:
+      • ckpt.pt          — single canonical checkpoint
+      • epoch_NNN.pt     — epoch-based saves; highest epoch is used
+    """
+    ckpt_single = os.path.join(checkpoint_dir, 'ckpt.pt')
+    if os.path.exists(ckpt_single):
+        return ckpt_single
+
+    import glob
+    epoch_files = sorted(glob.glob(os.path.join(checkpoint_dir, 'epoch_*.pt')))
+    if epoch_files:
+        # sort by epoch number, return the latest
+        def _epoch_num(p):
+            try:
+                return int(os.path.basename(p).split('_')[1].split('.')[0])
+            except (IndexError, ValueError):
+                return -1
+        return max(epoch_files, key=_epoch_num)
+
+    raise FileNotFoundError(
+        f"No checkpoint file (ckpt.pt or epoch_*.pt) found in {checkpoint_dir}"
+    )
+
+
+class SuperdecFitter:
+    """SuperDec-based superquadric fitter for tabletop objects.
+
+    Defaults to the fine-tuned tabletop v2 model.  The base (non-fine-tuned)
+    checkpoints can be used by passing checkpoint_dir explicitly.
 
     Parameters
     ----------
     superdec_dir : str
         Path to the cloned superdec repository root.
-    checkpoint : str
-        'normalized' (recommended for generic tabletop objects)
-        or 'shapenet'.
+    checkpoint_dir : str, optional
+        Path to the checkpoint directory (absolute, or relative to CWD).
+        Must contain config.yaml and either ckpt.pt or epoch_*.pt files.
+        Defaults to ../checkpoints/superdec_tabletop/superdec_tabletop_finetune_v2
+        relative to superdec_dir.
     exist_threshold : float
         Primitives whose existence score is below this value are discarded.
         Lower → more primitives returned. Default 0.3.
     n_points : int
         Number of points sampled from each segment before inference.
-        Must be 4096 (SuperDec training resolution).
-    device : str
-        'cuda' or 'cpu'. CPU will work but is ~10× slower.
+        Must match the training resolution (4096). Do not change.
+    device : str, optional
+        'cuda' or 'cpu'. Defaults to CUDA if available.
     """
 
     def __init__(
         self,
         superdec_dir: str,
-        checkpoint: str = 'normalized',
+        checkpoint_dir: Optional[str] = None,
         exist_threshold: float = 0.3,
         n_points: int = 4096,
         device: Optional[str] = None,
@@ -133,18 +294,20 @@ class SuperdecFitter:
 
         from omegaconf import OmegaConf
         from superdec.superdec import SuperDec
-        self._normalize_points  = None  # lazy
+        self._normalize_points    = None   # initialised below
         self._denormalize_outdict = None
 
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.device = device
+        self.device          = device
         self.exist_threshold = exist_threshold
-        self.n_points = n_points
-        self.superdec_dir = superdec_dir
+        self.n_points        = n_points
+        self.superdec_dir    = superdec_dir
 
-        ckp_path = os.path.join(superdec_dir, 'checkpoints', checkpoint, 'ckpt.pt')
-        cfg_path = os.path.join(superdec_dir, 'checkpoints', checkpoint, 'config.yaml')
+        ckpt_dir = _resolve_checkpoint_dir(superdec_dir, checkpoint_dir)
+        ckp_path = _find_checkpoint_file(ckpt_dir)
+        cfg_path = os.path.join(ckpt_dir, 'config.yaml')
+
         if not os.path.exists(ckp_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckp_path}")
 
@@ -161,7 +324,8 @@ class SuperdecFitter:
         self._normalize_points   = normalize_points
         self._denormalize_outdict = denormalize_outdict
 
-        print(f"[SuperdecFitter] loaded checkpoint '{checkpoint}' on {device}")
+        print(f"[SuperdecFitter] loaded checkpoint '{os.path.basename(ckp_path)}' "
+              f"from {ckpt_dir} on {device}")
 
     # ------------------------------------------------------------------
     def fit_adaptive(
@@ -184,7 +348,7 @@ class SuperdecFitter:
         """
         pts = np.asarray(points, dtype=np.float64)
         if len(pts) < 10:
-            return MultiSQFit(primitives=[], total_chamfer_l2=0.0)
+            return MultiSQFit(primitives=[], n_points=0)
 
         # sample to fixed resolution
         n = len(pts)
@@ -223,8 +387,8 @@ class SuperdecFitter:
             if float(exist_score[p_idx]) < self.exist_threshold:
                 continue
 
-            e1 = float(np.clip(exponents[p_idx, 0], 0.1, 1.9))
-            e2 = float(np.clip(exponents[p_idx, 1], 0.1, 1.9))
+            e1 = float(np.clip(exponents[p_idx, 0], SQ_EXPONENT_MIN, SQ_EXPONENT_CONVEX_MAX))
+            e2 = float(np.clip(exponents[p_idx, 1], SQ_EXPONENT_MIN, SQ_EXPONENT_CONVEX_MAX))
             sx, sy, sz = (float(v) for v in np.abs(scales[p_idx]))
             tx, ty, tz = (float(v) for v in translations[p_idx])
             rx, ry, rz = _rotmat_to_euler_xyz(rotations[p_idx])
@@ -241,27 +405,14 @@ class SuperdecFitter:
             )
             primitives.append(fit)
 
-        # compute per-primitive Chamfer L2 using assign_matrix
-        # assign_matrix: (N_pts, P) soft assignment weights
-        if primitives and len(pts) > 0:
-            pts32 = pts.astype(np.float32)
-            assign = raw_out.get('assign_matrix')
-            if assign is not None:
-                assign_np = assign[0].cpu().numpy()  # (N_pts, P_total)
-            for i, fit in enumerate(primitives):
-                centroid = np.array([fit.tx, fit.ty, fit.tz], dtype=np.float32)
-                dists_sq = np.sum((pts32 - centroid) ** 2, axis=1)
-                if assign is not None and i < assign_np.shape[1]:
-                    weights = assign_np[:, i]  # (n_sub,)
-                    n = min(weights.shape[0], dists_sq.shape[0])
-                    weights = weights[:n] / (weights[:n].sum() + 1e-8)
-                    l2 = float(np.sum(weights * dists_sq[:n]))
-                else:
-                    l2 = float(np.mean(dists_sq))
-                fit.chamfer_l2 = l2
+        _clamp_exponents(primitives)
 
-        total_l2 = float(np.mean([p.chamfer_l2 for p in primitives])) if primitives else 0.0
-        return MultiSQFit(primitives=primitives)
+        # compute per-primitive Chamfer L2 via surface sampling
+        if primitives and len(pts) > 0:
+            for fit in primitives:
+                fit.chamfer_l2 = _chamfer_l2_from_surface(pts, fit)
+
+        return MultiSQFit(primitives=primitives, n_points=len(pts))
 
     def fit_batch(self, points_list: List[np.ndarray]) -> List['MultiSQFit']:
         """
@@ -273,7 +424,7 @@ class SuperdecFitter:
 
         valid_idx = [i for i, pts in enumerate(points_list) if len(pts) >= 10]
         if not valid_idx:
-            return [MultiSQFit(primitives=[]) for _ in points_list]
+            return [MultiSQFit(primitives=[], n_points=0) for _ in points_list]
 
         pts_raw_list   = []
         translations   = []
@@ -311,19 +462,18 @@ class SuperdecFitter:
         if exist_score.min() < -0.5 or exist_score.max() > 1.5:
             exist_score = 1.0 / (1.0 + np.exp(-exist_score))
 
-        results = [MultiSQFit(primitives=[]) for _ in points_list]
+        results = [MultiSQFit(primitives=[], n_points=0) for _ in points_list]
 
         for b, orig_i in enumerate(valid_idx):
-            pts32 = pts_raw_list[b].astype(np.float32)
-            assign_np = assign[b].cpu().numpy() if assign is not None else None
+            pts_b = pts_raw_list[b]
 
             primitives = []
             for p_idx in range(scales_out.shape[1]):
                 if float(exist_score[b, p_idx]) < self.exist_threshold:
                     continue
 
-                e1 = float(np.clip(exponents[b, p_idx, 0], 0.1, 1.9))
-                e2 = float(np.clip(exponents[b, p_idx, 1], 0.1, 1.9))
+                e1 = float(np.clip(exponents[b, p_idx, 0], SQ_EXPONENT_MIN, SQ_EXPONENT_CONVEX_MAX))
+                e2 = float(np.clip(exponents[b, p_idx, 1], SQ_EXPONENT_MIN, SQ_EXPONENT_CONVEX_MAX))
                 sx, sy, sz = (float(v) for v in np.abs(scales_out[b, p_idx]))
                 tx, ty, tz = (float(v) for v in trans_out[b, p_idx])
                 rx, ry, rz = _rotmat_to_euler_xyz(rotations[b, p_idx])
@@ -340,20 +490,13 @@ class SuperdecFitter:
                 )
                 primitives.append(fit)
 
-            if primitives:
-                for i, fit in enumerate(primitives):
-                    centroid = np.array([fit.tx, fit.ty, fit.tz], dtype=np.float32)
-                    dists_sq = np.sum((pts32 - centroid) ** 2, axis=1)
-                    if assign_np is not None and i < assign_np.shape[1]:
-                        weights = assign_np[:, i]
-                        n = min(weights.shape[0], dists_sq.shape[0])
-                        weights = weights[:n] / (weights[:n].sum() + 1e-8)
-                        l2 = float(np.sum(weights * dists_sq[:n]))
-                    else:
-                        l2 = float(np.mean(dists_sq))
-                    fit.chamfer_l2 = l2
+            _clamp_exponents(primitives)
 
-            results[orig_i] = MultiSQFit(primitives=primitives)
+            if primitives and len(pts_b) > 0:
+                for fit in primitives:
+                    fit.chamfer_l2 = _chamfer_l2_from_surface(pts_b, fit)
+
+            results[orig_i] = MultiSQFit(primitives=primitives, n_points=len(pts_b))
 
         return results
 

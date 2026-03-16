@@ -142,8 +142,27 @@ class SuperquadricFit:
     def signed_distance(self, points: np.ndarray) -> np.ndarray:
         return sq_signed_distance_batch(points, self.params)
 
-    def surface_points(self, n: int = 1024) -> np.ndarray:
-        return sq_sample_surface(self.params, n)
+    def surface_points(self, n_u: int = 50, n_v: int = 50) -> np.ndarray:
+        """Sample points on the superquadric surface.
+
+        Parameters
+        ----------
+        n_u : int
+            Grid resolution along polar angle u ∈ [-π/2, π/2].  Default 50.
+        n_v : int
+            Grid resolution along azimuthal angle v ∈ [-π, π].  Default 50.
+
+        Returns
+        -------
+        (n_u * n_v, 3) float64 array in world coordinates.
+
+        Notes
+        -----
+        Higher resolution improves Chamfer L2 accuracy at quadratic cost.
+        Recommended: n_u=n_v=50 for real-time use, n_u=n_v=100 for
+        offline evaluation.
+        """
+        return sq_sample_surface(self.params, n_u=n_u, n_v=n_v)
 
     def is_point_inside(self, points: np.ndarray) -> np.ndarray:
         return self.signed_distance(points) < 0
@@ -171,8 +190,9 @@ class MultiSQFit:
         dists = np.stack([p.signed_distance(points) for p in self.primitives])
         return dists.min(axis=0)
 
-    def all_surface_points(self, n_per: int = 512) -> np.ndarray:
-        return np.concatenate([p.surface_points(n_per) for p in self.primitives])
+    def all_surface_points(self, n_u_per: int = 50, n_v_per: int = 50) -> np.ndarray:
+        return np.concatenate([p.surface_points(n_u=n_u_per, n_v=n_v_per)
+                               for p in self.primitives])
 
     def __len__(self):
         return len(self.primitives)
@@ -231,20 +251,48 @@ def sq_signed_distance_batch(points: np.ndarray, params: np.ndarray) -> np.ndarr
     return np.sign(f - 1.0) * dr
 
 
-def sq_sample_surface(params: np.ndarray, n: int = 1024) -> np.ndarray:
+def sq_sample_surface(params: np.ndarray, n_u: int = 50, n_v: int = 50) -> np.ndarray:
+    """Sample points on the surface of a superquadric using a regular UV grid.
+
+    Parameters
+    ----------
+    params : (11,) array
+        [sx, sy, sz, e1, e2, tx, ty, tz, rx, ry, rz]
+    n_u : int
+        Number of grid points along the polar angle u ∈ [-π/2, π/2].
+        Default 50.  Higher values improve Chamfer L2 accuracy at a
+        quadratic cost in point count (n_u × n_v total samples).
+    n_v : int
+        Number of grid points along the azimuthal angle v ∈ [-π, π].
+        Default 50.
+
+    Returns
+    -------
+    (n_u * n_v, 3) float64 surface-point array in world coordinates.
+
+    Notes
+    -----
+    A grid-based parametric sample provides uniform angular coverage and
+    deterministic output, unlike random sampling.  Recommended values:
+      • Real-time use (Chamfer quality estimate): n_u=n_v=50  (2 500 pts)
+      • Offline evaluation (higher accuracy):     n_u=n_v=100 (10 000 pts)
+    """
     sx, sy, sz, e1, e2 = params[:5]
     t = params[5:8]
     R = _euler_to_rot(params[8:11])
 
-    u = np.random.uniform(-np.pi/2, np.pi/2, n)
-    v = np.random.uniform(-np.pi,   np.pi,   n)
+    u = np.linspace(-np.pi/2, np.pi/2, n_u)
+    v = np.linspace(-np.pi,   np.pi,   n_v)
+    uu, vv = np.meshgrid(u, v)
+    uu = uu.ravel()
+    vv = vv.ravel()
 
     def _sign_pow(x, p):
         return np.sign(x) * (np.abs(x) ** p)
 
-    x = sx * _sign_pow(np.cos(u), e1) * _sign_pow(np.cos(v), e2)
-    y = sy * _sign_pow(np.cos(u), e1) * _sign_pow(np.sin(v), e2)
-    z = sz * _sign_pow(np.sin(u), e1)
+    x = sx * _sign_pow(np.cos(uu), e1) * _sign_pow(np.cos(vv), e2)
+    y = sy * _sign_pow(np.cos(uu), e1) * _sign_pow(np.sin(vv), e2)
+    z = sz * _sign_pow(np.sin(uu), e1)
 
     pts_canon = np.stack([x, y, z], axis=1)
     return (R @ pts_canon.T).T + t
@@ -400,8 +448,8 @@ def lm_optimize(
 # ---------------------------------------------------------------------------
 
 def chamfer_l2(points: np.ndarray, sq_params: np.ndarray,
-               n_surface: int = 1024) -> float:
-    surf    = sq_sample_surface(sq_params, n_surface)
+               n_u: int = 50, n_v: int = 50) -> float:
+    surf    = sq_sample_surface(sq_params, n_u=n_u, n_v=n_v)
     diff_ps = points[:, None, :] - surf[None, :, :]
     d_ps    = np.min(np.sum(diff_ps**2, axis=2), axis=1)
     diff_sp = surf[:, None, :] - points[None, :, :]
