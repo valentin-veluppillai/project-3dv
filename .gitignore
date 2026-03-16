@@ -2,6 +2,7 @@
 .idea
 *.log
 tmp/
+3DVproj
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
