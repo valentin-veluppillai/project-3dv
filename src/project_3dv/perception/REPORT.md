@@ -202,17 +202,16 @@ The 5-scene LM evaluation (xy_radius=3.0 m) produced 23–36 detected segments a
 | **2** | **SuperDec double-normalisation fix** | **DONE** | Resolves L2, Goal 1. `for_superdec` at line 293 of `pipeline.py`; `_check_input_contract` at line 578 of `superdec_fitter.py`. |
 | **3** | **Dual-set segmentation** | **DONE** | Resolves L3 partially, Goal 1. `segment_instances_dual` at line 1116 of `pipeline.py`. |
 | **4** | **Confidence-weighted Chamfer L2** | **DONE** | Goal 1. `confidence_weighted_chamfer` at line 170 of `superdec_fitter.py` with unweighted-mean fallback. |
-| **5** | **True SQ SDF and cuRobo export** | **PARTIAL** | Resolves L5, L6, Goal 3. Prompt exists, Medium. `fits_to_curobo_obstacles` exports `'sdf_fn': fit.signed_distance` (line 800). No `'state'` field and no native cuRobo SQ kernel yet. |
-| **6** | **Dynamic world model** | **PARTIAL** | Resolves L7, Goal 2. Prompt exists, Medium. `SQWorldModel` dataclass exists (line 160) with properties and `to_curobo_obstacles()`; state-transition methods are still missing. |
+| **5** | **True SQ SDF and cuRobo export** | **PARTIAL** | Resolves L5, L6, Goal 3. `fits_to_curobo_obstacles` exports `'sdf_fn': fit.signed_distance` (line 800). No `'state'` field and no native cuRobo SQ kernel yet. |
+| **6** | **Dynamic world model** | **PARTIAL** | Resolves L7, Goal 2. `SQWorldModel` dataclass exists (line 160) with properties and `to_curobo_obstacles()`; state-transition methods are still missing. |
 | **7** | **Latency instrumentation** | **DONE** | Resolves L8 (measurement), Goal 4. `PerceptionTimer` at line 115; four stages timed in `single_frame_pipeline`. |
-| **8** | **Collision coverage metric** | **TODO** | Resolves L5, Goal 4. No prompt. Small. Not started. |
-| **9** | **Stacked object detection** | **TODO** | Resolves L4, Goal 1. No prompt. Medium. Not started. |
-| **10** | **EMS robust fitter (Liu et al. CVPR 2022)** | **TODO** | Resolves L8, Goal 1. Prompt exists, Medium. Not started — no TRF, no outlier weighting, no S-step in either `superquadric.py` or `superdec_fitter.py`. |
-| **11** | **Equal-distance surface sampling and Chamfer** | **DONE** | Goal 1. Prompt exists, Small. `sample_surface_equal_distance` at line 479 of `superquadric.py`; parsimony and conf-L2 columns in eval script. |
-| **12** | **GPU end-to-end SuperDec evaluation** | **TODO** | Depends on TODO 2. No prompt. Small (execution). Not started — no GPU on login node. |
-| **13** | **Isaac Sim / MuJoCo simulation** | **TODO** | Resolves L9, Goal 4. No prompt. Large. Not started — depends on TODOs 5 and 6. |
-| **14** | **ROS interface** | **TODO** | Resolves L10, Goal 4. No prompt. Large. Not started — depends on TODOs 1, 5, 6, 7. |
-| **15** | **REPORT.md maintenance** | **PARTIAL** | Ongoing, Small. In progress — this update. |
+| **8** | **Collision coverage metric** | **TODO** | Resolves L5, Goal 4. Not started. |
+| **9** | **Stacked object detection** | **TODO** | Resolves L4, Goal 1. Not started. |
+| **10** | **EMS robust fitter (Liu et al. CVPR 2022)** | **TODO** | Resolves L8, Goal 1. Not started — no TRF, no outlier weighting, no S-step in either `superquadric.py` or `superdec_fitter.py`. |
+| **11** | **Equal-distance surface sampling and Chamfer** | **DONE** | Goal 1. `sample_surface_equal_distance` at line 479 of `superquadric.py`; parsimony and conf-L2 columns in eval script. |
+| **12** | **GPU end-to-end SuperDec evaluation** | **TODO** | Depends on TODO 2. Not started — no GPU on login node. |
+| **13** | **Isaac Sim / MuJoCo simulation** | **TODO** | Resolves L9, Goal 4. Not started — depends on TODOs 5 and 6. |
+| **14** | **ROS interface** | **TODO** | Resolves L10, Goal 4.  Not started — depends on TODOs 1, 5, 6, 7. |
 
 ## Summary by Status
 
