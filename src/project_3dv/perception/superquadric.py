@@ -447,6 +447,150 @@ def lm_optimize(
 # Chamfer distance
 # ---------------------------------------------------------------------------
 
+def _arclength_resample(t_dense: np.ndarray, xy: np.ndarray,
+                        n_out: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Resample a 2-D parametric curve at equal arc-length intervals.
+
+    Parameters
+    ----------
+    t_dense : (N,) parameter values.
+    xy      : (N, 2) curve points.
+    n_out   : number of output samples.
+
+    Returns
+    -------
+    t_out  : (n_out,) resampled parameter values.
+    xy_out : (n_out, 2) resampled curve points.
+    """
+    diffs  = np.diff(xy, axis=0)
+    seg_len = np.sqrt((diffs ** 2).sum(axis=1))
+    cumlen  = np.concatenate([[0.0], np.cumsum(seg_len)])
+    total   = float(cumlen[-1])
+    if total < 1e-12:
+        idx = np.round(np.linspace(0, len(t_dense) - 1, n_out)).astype(int)
+        return t_dense[idx], xy[idx]
+    targets = np.linspace(0.0, total, n_out)
+    t_out   = np.interp(targets, cumlen, t_dense)
+    x_out   = np.interp(targets, cumlen, xy[:, 0])
+    y_out   = np.interp(targets, cumlen, xy[:, 1])
+    return t_out, np.stack([x_out, y_out], axis=1)
+
+
+def sample_surface_equal_distance(sq: 'SuperquadricFit',
+                                  n_points: int = 500,
+                                  n_dense:  int = 1000) -> np.ndarray:
+    """Sample SQ surface with approximately equal arc-length spacing.
+
+    Uniform (eta, omega) sampling clusters points near the z-poles, biasing
+    the Chamfer L2 metric.  This function uses the equal-distance algorithm
+    from Liu et al. CVPR 2022, Supplementary Sec. 4 (extending Vaskevicius &
+    Birk 2019):
+
+      1. Sample the principal superellipse {e1, 1, sz} with equal arc-length
+         spacing → latitude angles eta_i and ring scale factors cos^e1(eta_i).
+      2. For each latitude, sample the orthogonal ring
+         {e2, sx·r_i, sy·r_i} with the same arc-length delta.
+      3. Combine via the SQ parametric equation to get 3-D points.
+      4. Apply the SQ pose (R, t).
+      5. Sub/upsample to exactly n_points.
+
+    Parameters
+    ----------
+    sq       : SuperquadricFit
+    n_points : target number of surface points (default 500).
+    n_dense  : dense parameter grid size used for arc-length estimation
+               (default 1000; higher = more accurate distribution).
+
+    Returns
+    -------
+    (n_points, 3) float64 array in world coordinates.
+    """
+    def _sp(x, e):
+        return np.sign(x) * (np.abs(x) ** e)
+
+    e1 = float(np.clip(sq.e1, 1e-6, 2.0))
+    e2 = float(np.clip(sq.e2, 1e-6, 2.0))
+    sx, sy, sz = float(sq.sx), float(sq.sy), float(sq.sz)
+
+    # ── Step 1: equal arc-length latitude samples ──────────────────────────
+    eta_dense = np.linspace(-np.pi / 2, np.pi / 2, n_dense)
+    lat_r  = _sp(np.cos(eta_dense), e1)          # cos^e1(eta) — ring scale [0,1]
+    lat_z  = sz * _sp(np.sin(eta_dense), e1)     # z on surface [−sz, sz]
+
+    # Use physical (scaled) coordinates for arc-length computation so that
+    # the pole transition (Δx ≈ sx) and the barrel height (Δz ≈ sz) are
+    # weighted by their actual physical extents.  Without this, for a cylinder
+    # the unscaled Δr≈1 dominates Δz≈0.2, placing too many latitude samples
+    # near the poles.
+    # (Liu et al. CVPR 2022 Supplementary Sec. 4, Pilu & Fisher 1995)
+    lat_curve_phys = np.stack([sx * lat_r, lat_z], axis=1)  # physical units
+
+    diffs_lat       = np.diff(lat_curve_phys, axis=0)
+    seg_lat         = np.sqrt((diffs_lat ** 2).sum(axis=1))
+    perim_principal = float(seg_lat.sum())
+
+    # n_lat ≈ sqrt(n_points); delta in physical length units
+    n_lat = max(int(round(np.sqrt(n_points))), 4)
+    delta = perim_principal / n_lat if perim_principal > 1e-10 else 1.0
+
+    # Resample at equal physical arc-length; recover unscaled ring scale
+    _, lat_phys_resampled = _arclength_resample(eta_dense, lat_curve_phys, n_lat)
+    lat_r_vals = lat_phys_resampled[:, 0] / (sx + 1e-12)  # back to [0, 1]
+    lat_z_vals = lat_phys_resampled[:, 1]
+
+    omega_dense = np.linspace(-np.pi, np.pi, n_dense + 1)[:-1]  # n_dense pts
+
+    # ── Step 3: collect surface points ────────────────────────────────────
+    all_pts: List[np.ndarray] = []
+
+    for r_scale, z_val in zip(lat_r_vals, lat_z_vals):
+        r = float(abs(r_scale))
+
+        ring_x = sx * r * _sp(np.cos(omega_dense), e2)
+        ring_y = sy * r * _sp(np.sin(omega_dense), e2)
+        # Close the ring for arc-length computation
+        ring_cx = np.append(ring_x, ring_x[0])
+        ring_cy = np.append(ring_y, ring_y[0])
+        diffs   = np.diff(np.stack([ring_cx, ring_cy], axis=1), axis=0)
+        seg_len = np.sqrt((diffs ** 2).sum(axis=1))
+        perimeter = float(seg_len.sum())
+
+        # Skip rings too small to contribute a full sample at this delta.
+        # This avoids accumulating many near-zero polar rings that would
+        # crowd the up-sampling pool and distort the z-distribution.
+        n_lon = int(round(perimeter / delta))
+        if n_lon == 0:
+            continue
+
+        cumlen = np.concatenate([[0.0], np.cumsum(seg_len)])  # n_dense+1 vals
+        # targets: n_lon equally-spaced arc positions on [0, perimeter)
+        targets = np.linspace(0.0, perimeter, n_lon + 1)[:-1]
+        # cumlen[:-1] (n_dense values) aligns with ring_x/ring_y
+        rx_eq = np.interp(targets, cumlen[:-1], ring_x)
+        ry_eq = np.interp(targets, cumlen[:-1], ring_y)
+        z_arr = np.full(n_lon, float(z_val))
+        all_pts.append(np.stack([rx_eq, ry_eq, z_arr], axis=1))
+
+    if not all_pts:
+        return np.zeros((n_points, 3), dtype=np.float64)
+
+    pts_local = np.vstack(all_pts).astype(np.float64)
+
+    # ── Step 4: sub/upsample to exactly n_points ───────────────────────────
+    if len(pts_local) > n_points:
+        idx = np.random.choice(len(pts_local), n_points, replace=False)
+        pts_local = pts_local[idx]
+    elif len(pts_local) < n_points:
+        extra = np.random.choice(len(pts_local),
+                                 n_points - len(pts_local), replace=True)
+        pts_local = np.vstack([pts_local, pts_local[extra]])
+
+    # ── Step 5: apply SQ pose ──────────────────────────────────────────────
+    R = np.array(sq.rotation_matrix, dtype=np.float64)
+    t = np.array(sq.translation,     dtype=np.float64)
+    return (R @ pts_local.T).T + t
+
+
 def chamfer_l2(points: np.ndarray, sq_params: np.ndarray,
                n_u: int = 50, n_v: int = 50) -> float:
     surf    = sq_sample_surface(sq_params, n_u=n_u, n_v=n_v)

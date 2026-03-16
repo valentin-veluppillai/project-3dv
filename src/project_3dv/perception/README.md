@@ -275,6 +275,57 @@ Individual test files:
 
 ---
 
+## Testing
+
+### Synthetic tests (no dataset required)
+
+All 75 tests use synthetic point clouds and can be run immediately without any
+external data:
+
+```bash
+pytest tests/ -m "not requires_data"
+```
+
+### Dataset tests (OCID required)
+
+Three additional integration tests run the full pipeline on a real OCID
+RGB-D frame and compare against ground-truth instance masks.  They are
+marked `@pytest.mark.requires_data` and are **automatically skipped** with a
+clear message when the dataset is absent.
+
+**Step 1 — download the dataset** (~15 GB):
+
+```bash
+bash scripts/download_ocid.sh          # → data/ocid/ (default)
+# or to a custom path:
+bash scripts/download_ocid.sh /my/data/ocid
+```
+
+The script downloads from the
+[OCID dataset page](https://www.acin.tuwien.ac.at/vision-for-robotics/software-tools/object-cluttered-indoor-dataset/)
+(TU Wien), verifies the SHA-256 checksum, and extracts the three subsets
+(`ARID20/`, `ARID10/`, `YCB10/`) into the destination directory.
+
+**Step 2 — run the dataset tests**:
+
+```bash
+pytest tests/ -m requires_data -v
+```
+
+| Test | What it checks |
+|---|---|
+| `test_table_removed` | `remove_table()` reduces the point count on a real OCID frame |
+| `test_instances_match_gt` | `segment_instances()` count is within ±2 of the GT label count |
+| `test_sq_fits_are_valid` | Every `MultiSQFit` has finite pose, scale > 0, exponents in (0, 2] |
+
+**Run all tests (synthetic + dataset)**:
+
+```bash
+pytest tests/ -v
+```
+
+---
+
 ## Directory structure
 
 ```

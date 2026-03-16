@@ -40,13 +40,18 @@ Grasp planning
 
 from .pipeline import (
     depth_to_pointcloud,
+    pointcloud_from_depth,
     remove_table,
     segment_instances,
+    segment_instances_dual,
     classify_shape_hint,
     fit_superquadrics,
     TabletopPerception,
     ObjectSegment,
     PerceptionResult,
+    PerceptionTimer,
+    SQWorldModel,
+    single_frame_pipeline,
 )
 from .superquadric import (
     SuperquadricFitter,
@@ -75,14 +80,20 @@ except ImportError:
 __all__ = [
     # pipeline stages
     "depth_to_pointcloud",
+    "pointcloud_from_depth",
     "remove_table",
     "segment_instances",
+    "segment_instances_dual",
     "classify_shape_hint",
     "fit_superquadrics",
     # orchestrator + data structures
     "TabletopPerception",
     "ObjectSegment",
     "PerceptionResult",
+    "PerceptionTimer",
+    "SQWorldModel",
+    # single-frame entry point
+    "single_frame_pipeline",
     # SQ fitting
     "SuperquadricFitter",
     "SuperdecFitter",

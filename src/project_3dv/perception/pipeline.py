@@ -38,7 +38,10 @@ Design notes
   • All stage functions are importable standalone for testing.
 """
 
+import copy
 import logging
+import os
+import time
 import numpy as np
 import open3d as o3d
 from dataclasses import dataclass, field
@@ -109,6 +112,95 @@ class PerceptionResult:
         return "\n".join(lines)
 
 
+class PerceptionTimer:
+    """Wall-clock profiler for perception pipeline stages.
+
+    Usage::
+
+        timer = PerceptionTimer()
+        timer.start('unproject')
+        pts = pointcloud_from_depth(depth, K)
+        timer.stop('unproject')
+        print(timer.to_dict())   # {'unproject': 0.003}
+        print(f"total: {timer.total*1000:.1f} ms")
+
+    Each stage accumulates across repeated start/stop calls, so it is safe
+    to call inside a per-segment loop.
+    """
+
+    def __init__(self) -> None:
+        self._times: dict  = {}   # stage → total elapsed seconds
+        self._starts: dict = {}   # stage → last start timestamp
+
+    def start(self, stage: str) -> None:
+        """Record the start of *stage*."""
+        self._starts[stage] = time.perf_counter()
+
+    def stop(self, stage: str) -> float:
+        """Record the end of *stage*; return elapsed seconds."""
+        t0 = self._starts.pop(stage, None)
+        if t0 is None:
+            _log.debug("PerceptionTimer.stop('%s') without matching start()", stage)
+            return 0.0
+        dt = time.perf_counter() - t0
+        self._times[stage] = self._times.get(stage, 0.0) + dt
+        return dt
+
+    def to_dict(self) -> dict:
+        """Return ``{stage_name: elapsed_seconds}`` for every stopped stage."""
+        return dict(self._times)
+
+    @property
+    def total(self) -> float:
+        """Sum of all recorded stage durations (seconds)."""
+        return sum(self._times.values())
+
+
+@dataclass
+class SQWorldModel:
+    """Compact superquadric scene model for a single RGB-D observation.
+
+    Returned by :func:`single_frame_pipeline` and serves as the canonical
+    interface for downstream manipulation modules:
+
+    * **Collision geometry**  — :meth:`to_curobo_obstacles` (CuRobo motions)
+    * **Signed-distance SDF** — ``Scene.from_fits(world_model.all_primitives)``
+    * **Grasp candidates**    — ``GraspSelector(world_model.all_primitives)``
+
+    Parameters
+    ----------
+    fits : list[MultiSQFit]
+        One :class:`MultiSQFit` per detected object, poses in world frame.
+    """
+    fits: list   # List[MultiSQFit] — typed as plain list to avoid circular import
+
+    @property
+    def n_objects(self) -> int:
+        """Number of segmented object instances."""
+        return len(self.fits)
+
+    @property
+    def n_primitives(self) -> int:
+        """Total superquadric primitives across all objects."""
+        return sum(len(m.primitives) for m in self.fits)
+
+    @property
+    def all_primitives(self) -> list:
+        """Flat list of every :class:`SuperquadricFit` in the scene."""
+        return [p for m in self.fits for p in m.primitives]
+
+    def to_curobo_obstacles(self, margin: float = 0.005) -> list:
+        """Convert all primitives to CuRobo obstacle dicts.
+
+        Parameters
+        ----------
+        margin : float
+            Uniform safety margin inflating every primitive (metres).
+        """
+        from superquadric import fits_to_curobo_obstacles
+        return fits_to_curobo_obstacles(self.all_primitives, margin=margin)
+
+
 # ---------------------------------------------------------------------------
 # Internal utilities
 # ---------------------------------------------------------------------------
@@ -128,6 +220,318 @@ def _to_o3d(pts: np.ndarray) -> o3d.geometry.PointCloud:
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
     return pcd
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing — point cloud cleaning, normalisation, PCA canonicalisation
+# ---------------------------------------------------------------------------
+
+_log = logging.getLogger(__name__)
+
+
+def _r_x(deg: float) -> np.ndarray:
+    """3×3 rotation matrix around the X axis by *deg* degrees."""
+    rad = float(np.deg2rad(deg))
+    c, s = float(np.cos(rad)), float(np.sin(rad))
+    return np.array([[1., 0., 0.],
+                     [0.,  c, -s],
+                     [0.,  s,  c]], dtype=np.float64)
+
+
+# Per-category canonical rotation applied AFTER preprocess_pointcloud() and
+# BEFORE SuperDec inference.
+#
+# Ablation results (SuperDec fine-tuned, 3 samples/category, orig-L2):
+#   Category  | with rotation | without rotation | verdict
+#   ----------|---------------|------------------|--------
+#   bottle    |  ~0.15 (bad)  |  ~0.074          | NO rotation — model fine-tuned on native Y-up
+#   mug       |  ~0.18 (bad)  |  ~0.088          | NO rotation — same reason
+#   bowl      |  0.105        |  0.115            | KEEP rotation — opening faces up correctly
+#   knife     |  (not tested) |  —               | keep R_x(90) provisionally
+#
+# Bottles and mugs are left at identity: SuperDec was fine-tuned on ShapeNet's
+# native Y-up orientation; rotating away from it breaks the model for those categories.
+SHAPENET_CATEGORY_ROTATIONS: dict = {
+    "02876657": _r_x(0),    # bottle  — identity; rotation hurts (ablation)
+    "03797390": _r_x(0),    # mug     — identity; rotation hurts (ablation)
+    "03624134": _r_x(90),   # knife   — long axis Y → Z (not ablated)
+    "03642806": _r_x(0),    # laptop  — flat, no rotation needed
+    "02880940": _r_x(90),   # bowl    — rotation helps: 0.105 vs 0.115 (ablation)
+    "gso":      _r_x(0),    # GSO    — unknown, leave as-is
+}
+
+
+def _fps_numpy(pts: np.ndarray, n_samples: int) -> np.ndarray:
+    """Farthest point sampling; returns index array of length n_samples."""
+    N = len(pts)
+    if n_samples >= N:
+        return np.arange(N)
+    # Pre-subsample for efficiency when N >> n_samples
+    if N > 4 * n_samples:
+        pre = np.random.choice(N, 4 * n_samples, replace=False)
+        sub_idx = _fps_numpy(pts[pre], n_samples)
+        return pre[sub_idx]
+    selected = np.zeros(n_samples, dtype=np.int64)
+    dists = np.full(N, np.inf)
+    selected[0] = 0
+    for i in range(1, n_samples):
+        last = pts[selected[i - 1]]
+        d = np.sum((pts - last) ** 2, axis=1)
+        dists = np.minimum(dists, d)
+        selected[i] = int(np.argmax(dists))
+    return selected
+
+
+def preprocess_pointcloud(
+    pts: np.ndarray,
+    normals: Optional[np.ndarray] = None,
+    target_n: int = 4096,
+    outlier_std: float = 2.5,
+    rotate: bool = False,
+    table_normal: Optional[np.ndarray] = None,
+    table_height: float = 0.0,
+    for_superdec: bool = False,
+) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
+    """Clean and resample an object point cloud for SQ fitting.
+
+    Steps
+    -----
+    0. (Optional) Table-frame canonicalisation — when *table_normal* is
+       provided, the cloud is brought into a coordinate frame where the table
+       surface is the XY plane.  This is applied **before** outlier removal.
+       Two sub-steps:
+         A. Translate along the table normal so that the segment centroid's
+            height above the table becomes zero (removes the height component
+            of the centroid, leaving XY position intact).
+         B. Rotate so that *table_normal* maps to +Z (Rodriguez formula,
+            no scipy).  When the normal is already [0,0,1] this is the
+            identity.  PCA canonicalisation (rotate=True) is skipped when
+            table_normal is provided.
+    1. Statistical outlier removal — drop points outside
+       centroid ± outlier_std * std on **any** axis (axis-aligned box test).
+    2. Optional PCA orientation canonicalisation via SVD (``rotate=True``) —
+       rotate so the longest principal axis maps to Z and the second to Y.
+       Disabled by default; also skipped when table_normal is provided
+       (table frame is already a principled canonical frame).
+    3. Uniform resampling to exactly *target_n* points:
+       - N > target_n : Farthest Point Sampling.
+       - N < target_n : random duplication + Gaussian jitter (σ = 0.001).
+       - N == target_n: no-op.
+
+    Note: scale normalisation (divide by max radius) is intentionally omitted
+    because SuperdecFitter already normalises to unit sphere internally via
+    ``normalize_points()``.  Adding a second normalisation here caused double
+    scaling and degraded Chamfer L2.
+
+    Parameters
+    ----------
+    pts          : (N, 3) input point cloud
+    normals      : (N, 3) optional normals; same outlier mask and rotation
+                   applied (rotation only — not scaled or translated).
+    target_n     : target point count (default 4096)
+    outlier_std  : axis-aligned std multiplier for outlier removal
+    rotate       : if True, apply PCA canonicalisation (default False).
+                   Ignored when table_normal is not None.
+    table_normal : (3,) unit normal of the table plane in the input frame.
+                   When provided, Step 0 (table-frame canonicalisation) is
+                   applied and PCA rotation is skipped.
+    table_height : signed distance of the table plane from the origin along
+                   table_normal.  Used with table_normal to compute heights.
+    for_superdec : bool (default False)
+                   When True, indicates the output will be fed to
+                   SuperdecFitter rather than SuperquadricFitter (LM).
+                   Scale normalisation is skipped — SuperDec normalises
+                   internally via normalize_points() in fit_adaptive().
+                   Double normalisation would shift the input distribution
+                   away from the ShapeNet training regime.
+                   (Liu et al. CVPR 2022 Sec. 3.4; Supplementary Sec. 2)
+                   Outlier removal, FPS resampling, and table-frame rotation
+                   are still applied when for_superdec=True.
+
+    Returns
+    -------
+    pts_out     : (target_n, 3) preprocessed points
+    normals_out : (target_n, 3) or None
+    meta        : dict with keys
+                    'scale'              float — always 1.0 (no-op)
+                    'centroid'           (3,)  — always zeros (no-op)
+                    'rotation'           (3,3) — table or PCA rotation, or eye
+                    'n_outliers_removed' int
+                    'table_centroid'     (3,)  — only present when table_normal
+                                                 was provided; the translation
+                                                 subtracted in Step 0A
+                    'table_rotation'     (3,3) — only present when table_normal
+                                                 was provided; the rotation
+                                                 applied in Step 0B
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    if normals is not None:
+        normals = np.asarray(normals, dtype=np.float64)
+
+    meta_extra: dict = {}
+
+    # ── 0. Table-frame canonicalisation (optional) ────────────────────────────
+    if table_normal is not None:
+        n = np.asarray(table_normal, dtype=np.float64)
+        n = n / (np.linalg.norm(n) + 1e-12)
+
+        # Step 0A — translate: remove height component of segment centroid
+        seg_h = float(pts.mean(axis=0) @ n - table_height)
+        table_centroid = seg_h * n                     # vector along table normal
+        pts = pts - table_centroid
+        if normals is not None:
+            pass  # normals are directions; translation does not affect them
+        meta_extra["table_centroid"] = table_centroid
+
+        # Step 0B — rotate: map table_normal → [0, 0, 1] via Rodriguez
+        z = np.array([0.0, 0.0, 1.0])
+        v = np.cross(n, z)
+        s = float(np.linalg.norm(v))
+        c = float(np.dot(n, z))
+        if s < 1e-9:
+            # Normal is already ±Z
+            R_table = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+        else:
+            vx = np.array([
+                [ 0.0,  -v[2],  v[1]],
+                [ v[2],  0.0,  -v[0]],
+                [-v[1],  v[0],  0.0],
+            ])
+            R_table = np.eye(3) + vx + vx @ vx * (1.0 - c) / (s * s)
+        pts = (R_table @ pts.T).T
+        if normals is not None:
+            normals = (R_table @ normals.T).T
+        meta_extra["table_rotation"] = R_table
+
+    # ── 1. Outlier removal (per-axis std, axis-aligned box) ──────────────────
+    centroid0 = pts.mean(axis=0)
+    std0 = pts.std(axis=0)
+    std0[std0 < 1e-9] = 1e-9
+    mask = np.all(np.abs(pts - centroid0) <= outlier_std * std0, axis=1)
+    n_outliers = int((~mask).sum())
+    if n_outliers > 0:
+        _log.debug("preprocess_pointcloud: removed %d outliers (>%.1fσ per axis)",
+                   n_outliers, outlier_std)
+    pts = pts[mask]
+    if normals is not None:
+        normals = normals[mask]
+
+    if len(pts) < 10:
+        raise ValueError(
+            f"preprocess_pointcloud: only {len(pts)} points remain after "
+            "outlier removal — cannot continue."
+        )
+
+    pts_out = pts
+
+    # ── 2. Optional PCA canonicalisation via SVD ──────────────────────────────
+    # Skipped when table_normal is provided (table frame is already canonical).
+    if rotate and table_normal is None:
+        pts_c = pts_out - pts_out.mean(axis=0)
+        _, _, Vt = np.linalg.svd(pts_c, full_matrices=False)   # Vt: (3, 3)
+        # Vt[0] = longest axis → map to Z; Vt[1] → Y; Vt[2] → X
+        rotation = np.array([Vt[2], Vt[1], Vt[0]], dtype=np.float64)
+        if np.linalg.det(rotation) < 0:
+            rotation[0] = -rotation[0]   # ensure right-handed
+        pts_out = (rotation @ pts_c.T).T
+        if normals is not None:
+            normals = (rotation @ normals.T).T
+    else:
+        rotation = np.eye(3, dtype=np.float64)
+
+    # ── 3. Uniform resampling ─────────────────────────────────────────────────
+    N = len(pts_out)
+    if N > target_n:
+        idx = _fps_numpy(pts_out, target_n)
+        pts_out = pts_out[idx]
+        if normals is not None:
+            normals = normals[idx]
+    elif N < target_n:
+        n_add = target_n - N
+        idx = np.random.choice(N, n_add, replace=True)
+        jitter = np.random.normal(0.0, 0.001, (n_add, 3))
+        pts_out = np.vstack([pts_out, pts_out[idx] + jitter])
+        if normals is not None:
+            normals = np.vstack([normals, normals[idx]])
+
+    meta = {
+        "scale":              1.0,
+        "centroid":           np.zeros(3, dtype=np.float64),
+        "rotation":           rotation,
+        "n_outliers_removed": n_outliers,
+        **meta_extra,
+    }
+    return pts_out, normals, meta
+
+
+def postprocess_fits(
+    fits: list,
+    meta: dict,
+) -> list:
+    """Invert preprocess_pointcloud() transforms on fitted SQ poses.
+
+    The preprocessing applied::
+
+        pts_clean = rotation @ ((pts_orig - centroid) / scale)
+
+    The inverse is::
+
+        t_orig = rotation.T @ t_clean * scale + centroid
+        R_orig = rotation.T @ R_clean
+        sx/sy/sz *= scale
+
+    Parameters
+    ----------
+    fits : List[MultiSQFit]
+        Output of fit_superquadrics(), poses in the preprocessed frame.
+    meta : dict
+        As returned by preprocess_pointcloud().
+
+    Returns
+    -------
+    List[MultiSQFit] — same structure, but poses in the original frame.
+    """
+    import scipy.spatial.transform as _sst
+
+    R_pca = meta["rotation"]     # (3, 3)
+    R_inv = R_pca.T              # orthogonal inverse
+    scale = float(meta["scale"])
+    centroid = np.asarray(meta["centroid"], dtype=np.float64)
+
+    from superquadric import MultiSQFit   # lazy — superquadric.py may not be on path at import time
+
+    # Table-frame inversion (applied last — outermost in the transform chain).
+    # These keys are only present when preprocess_pointcloud was called with
+    # table_normal != None.
+    R_table    = np.asarray(meta["table_rotation"], dtype=np.float64) \
+                 if "table_rotation" in meta else None
+    tbl_centroid = np.asarray(meta["table_centroid"], dtype=np.float64) \
+                   if "table_centroid" in meta else None
+
+    result = []
+    for multi in fits:
+        new_prims = []
+        for prim in multi.primitives:
+            p = copy.copy(prim)
+            # Scale semi-axes back to world units
+            p.sx = prim.sx * scale
+            p.sy = prim.sy * scale
+            p.sz = prim.sz * scale
+            # Invert PCA / identity rotation and scale
+            t_clean = prim.translation           # (3,)
+            t_orig = R_inv @ t_clean * scale + centroid
+            R_orig = R_inv @ prim.rotation_matrix
+            # Invert table-frame transform (outermost — applied last)
+            if R_table is not None:
+                R_tbl_inv = R_table.T             # orthogonal inverse
+                t_orig = R_tbl_inv @ t_orig + tbl_centroid
+                R_orig = R_tbl_inv @ R_orig
+            p.tx, p.ty, p.tz = float(t_orig[0]), float(t_orig[1]), float(t_orig[2])
+            rx, ry, rz = _sst.Rotation.from_matrix(R_orig).as_euler("xyz")
+            p.rx, p.ry, p.rz = float(rx), float(ry), float(rz)
+            new_prims.append(p)
+        result.append(MultiSQFit(primitives=new_prims, n_points=multi.n_points))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +569,57 @@ def depth_to_pointcloud(depth: np.ndarray, K: np.ndarray,
     pts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
     valid = (pts[:, 2] > 0) & (pts[:, 2] < max_depth)
     return pts[valid]
+
+
+def pointcloud_from_depth(
+    depth: np.ndarray,
+    K: np.ndarray,
+    extrinsic: Optional[np.ndarray] = None,
+    max_depth: float = 3.0,
+) -> np.ndarray:
+    """Unproject a float-metre depth image to a point cloud.
+
+    This is the primary entry point for single-view RGB-D input as described
+    in the project proposal (Sec. 2.1: "Starting from a depth image…
+    single-view reconstruction as the primary operating mode").
+
+    Unlike :func:`depth_to_pointcloud`, this function expects depth already
+    in **metres** (float32/float64, not uint16 millimetres) and supports an
+    optional camera-to-world extrinsic transform.
+
+    Parameters
+    ----------
+    depth     : (H, W) float32 or float64 depth image in metres.
+                Pixels with ``depth <= 0`` or ``depth >= max_depth`` are
+                treated as invalid and excluded from the output.
+    K         : (3, 3) camera intrinsic matrix ``[[fx,0,cx],[0,fy,cy],[0,0,1]]``.
+    extrinsic : (4, 4) camera-to-world transform (SE(3)).  If ``None``,
+                points are returned in the camera frame (Z forward, Y down).
+    max_depth : maximum valid depth in metres.  Default 3.0 m.
+
+    Returns
+    -------
+    (N, 3) float32 XYZ array.  World frame when *extrinsic* is provided,
+    camera frame otherwise.  Invalid pixels are excluded; N may be 0.
+    """
+    H, W = depth.shape
+    u, v = np.meshgrid(np.arange(W, dtype=np.float32),
+                       np.arange(H, dtype=np.float32))
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+
+    valid = (depth > 0) & (depth < max_depth)
+    z = depth[valid].astype(np.float32)
+    x = (u[valid] - cx) * z / fx
+    y = (v[valid] - cy) * z / fy
+    pts = np.stack([x, y, z], axis=1)   # (N, 3) float32
+
+    if extrinsic is not None:
+        E = np.asarray(extrinsic, dtype=np.float32)
+        pts_h = np.concatenate([pts, np.ones((len(pts), 1), dtype=np.float32)],
+                               axis=1)
+        pts = (E @ pts_h.T).T[:, :3]
+    return pts
 
 
 # ---------------------------------------------------------------------------
@@ -504,17 +959,67 @@ def _split_by_height_layers(pts: np.ndarray,
 # Stage 3 — Instance segmentation
 # ---------------------------------------------------------------------------
 
+def adaptive_cluster_eps(
+    pts: np.ndarray,
+    multiplier: float = 3.0,
+    eps_max: float = None,
+) -> float:
+    """Estimate a good DBSCAN neighbourhood radius from nearest-neighbour distances.
+
+    Subsamples up to 1 000 points, computes each point's distance to its
+    nearest neighbour, and returns ``multiplier × median(nn_distances)``.
+
+    This adapts automatically to the point density of the cloud, which is
+    critical when the same pipeline is used on both normalised single-object
+    clouds (ShapeNet, ~0.1–0.2 m scale) and real-world multi-object scenes
+    (RGB-D Scenes v2, distances in metres).
+
+    Parameters
+    ----------
+    pts        : (N, 3) point cloud
+    multiplier : scale factor applied to the median NN distance.
+                 3.0 is a reasonable default for most scenes; use 2.0 for
+                 denser clouds where objects are closely spaced.
+    eps_max    : optional hard upper cap (metres).  When the computed eps
+                 would exceed this value it is clamped to eps_max.  Useful
+                 as a safety net for scenes where table removal leaves too
+                 few points and the NN distances blow up.
+
+    Returns
+    -------
+    Estimated eps in the same length units as pts, clamped to eps_max.
+    """
+    from sklearn.neighbors import NearestNeighbors
+    n_sub = min(1000, len(pts))
+    idx   = np.random.choice(len(pts), n_sub, replace=False)
+    sub   = pts[idx].astype(np.float64)
+    nbrs  = NearestNeighbors(n_neighbors=2, algorithm="ball_tree").fit(sub)
+    dists, _ = nbrs.kneighbors(sub)
+    eps = float(multiplier * np.median(dists[:, 1]))
+    if eps_max is not None and eps > eps_max:
+        _log.warning(
+            "adaptive_cluster_eps: computed eps %.4f m > eps_max %.4f m; "
+            "clamping to eps_max.",
+            eps, eps_max,
+        )
+        eps = float(eps_max)
+    return eps
+
+
 def segment_instances(
     obj_pts: np.ndarray,
     obj_col: Optional[np.ndarray] = None,
-    cluster_eps:       float = 0.018,
-    cluster_min_points: int  = 20,
-    split_min_points:  int   = 600,
-    saddle_depth:      float = 0.25,
-    split_n_bins:      int   = 40,
-    concavity_threshold: float = 0.015,
+    cluster_eps:        float = 0.018,
+    cluster_min_points: int   = 20,
+    split_min_points:   int   = 600,
+    saddle_depth:       float = 0.25,
+    split_n_bins:       int   = 40,
+    concavity_threshold:  float = 0.015,
     height_gap_threshold: float = 0.008,
-    rgb_weight:        float = 0.0,
+    rgb_weight:           float = 0.0,
+    adaptive_eps:         bool  = False,
+    eps_multiplier:       float = 3.0,
+    eps_max:              Optional[float] = None,
 ) -> List[np.ndarray]:
     """Cluster foreground points into per-object groups.
 
@@ -525,7 +1030,8 @@ def segment_instances(
     ----------
     obj_pts               : (N, 3) foreground points above the table
     obj_col               : (N, 3) float32 RGB colours in [0, 1], optional
-    cluster_eps           : DBSCAN neighbourhood radius (metres)
+    cluster_eps           : DBSCAN neighbourhood radius (metres); overridden
+                            when adaptive_eps=True
     cluster_min_points    : minimum DBSCAN core-point neighbourhood size
     split_min_points      : cluster size threshold to trigger splitting passes
     saddle_depth          : relative density drop to trigger a saddle split
@@ -534,6 +1040,10 @@ def segment_instances(
     height_gap_threshold  : minimum empty-band height to trigger layer split
     rgb_weight            : colour feature weight for colour-aware DBSCAN
                             (0 = geometry-only; useful for strongly coloured scenes)
+    adaptive_eps          : if True, compute cluster_eps automatically via
+                            adaptive_cluster_eps() and ignore the cluster_eps arg
+    eps_multiplier        : multiplier passed to adaptive_cluster_eps(); only
+                            used when adaptive_eps=True
 
     Returns
     -------
@@ -541,6 +1051,10 @@ def segment_instances(
     """
     if len(obj_pts) == 0:
         return []
+
+    if adaptive_eps:
+        cluster_eps = adaptive_cluster_eps(obj_pts, multiplier=eps_multiplier, eps_max=eps_max)
+        _log.info("segment_instances: adaptive cluster_eps = %.4f m", cluster_eps)
 
     # DBSCAN clustering
     if obj_col is not None and rgb_weight > 0:
@@ -597,6 +1111,134 @@ def segment_instances(
             gap_threshold=height_gap_threshold))
 
     return after_height
+
+
+def segment_instances_dual(
+    obj_pts: np.ndarray,
+    cluster_eps:        float = 0.018,
+    cluster_min_points: int   = 20,
+    k_neighbours:       int   = 20,
+    iou_dedup_threshold: float = 0.5,
+    adaptive_eps:       bool  = False,
+    eps_multiplier:     float = 3.0,
+    eps_max:            Optional[float] = None,
+) -> List[np.ndarray]:
+    """PointGroup dual-set DBSCAN segmentation (Jiang et al. CVPR 2020).
+
+    Produces two independent cluster sets and returns their union with IoU
+    deduplication to reduce over- and under-segmentation:
+
+      C_p — standard DBSCAN on raw XYZ coordinates.
+      C_q — DBSCAN on centroid-offset-shifted coordinates:
+              for each point p_i, compute the mean coordinate of its k
+              nearest neighbours; the shifted point is
+              p_i + (centroid_of_kNN(p_i) − p_i).
+              This pulls scattered points toward object centres, making
+              DBSCAN more robust to non-uniform density.
+
+    Deduplication: any cluster in C_q that overlaps (point-set IoU >
+    iou_dedup_threshold) with an already-kept cluster from C_p is dropped,
+    preventing the same object from appearing twice.
+
+    Note: unlike the original PointGroup which uses a learned offset
+    prediction network, this implementation uses a simple geometric
+    k-NN centroid estimate.  It is fast (CPU, sklearn), parameter-free
+    beyond k and the dedup threshold, and does not require normals.
+
+    Parameters
+    ----------
+    obj_pts               : (N, 3) foreground points above the table.
+    cluster_eps           : DBSCAN neighbourhood radius (metres).
+    cluster_min_points    : DBSCAN min_samples.
+    k_neighbours          : k for the centroid-offset k-NN step.
+    iou_dedup_threshold   : minimum point-set IoU to suppress a C_q duplicate.
+    adaptive_eps          : compute eps automatically (same as segment_instances).
+    eps_multiplier        : multiplier for adaptive_cluster_eps().
+    eps_max               : upper bound for adaptive eps.
+
+    Returns
+    -------
+    List of (N_i, 3) arrays, one per detected instance, deduplicated.
+    """
+    from sklearn.cluster import DBSCAN as _DBSCAN
+    from sklearn.neighbors import NearestNeighbors
+
+    if len(obj_pts) == 0:
+        return []
+
+    if adaptive_eps:
+        cluster_eps = adaptive_cluster_eps(obj_pts, multiplier=eps_multiplier,
+                                           eps_max=eps_max)
+        _log.info("segment_instances_dual: adaptive cluster_eps = %.4f m", cluster_eps)
+
+    pts = obj_pts.astype(np.float64)
+
+    # ── Set C_p: standard DBSCAN on XYZ ──────────────────────────────────────
+    labels_p = _DBSCAN(
+        eps=cluster_eps, min_samples=cluster_min_points,
+        algorithm='ball_tree', n_jobs=1,
+    ).fit(pts).labels_
+
+    clusters_p: List[np.ndarray] = [
+        pts[labels_p == lbl]
+        for lbl in sorted(set(labels_p) - {-1})
+    ]
+
+    # ── Centroid-offset shift ─────────────────────────────────────────────────
+    k = min(k_neighbours, len(pts) - 1)
+    if k < 1:
+        return clusters_p   # degenerate cloud
+
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='ball_tree', n_jobs=1)
+    nbrs.fit(pts)
+    _, indices = nbrs.kneighbors(pts)          # (N, k+1); col 0 is the point itself
+    # centroid of the k nearest neighbours (excluding self)
+    knn_centroids = pts[indices[:, 1:]].mean(axis=1)   # (N, 3)
+    # shift: each point moves toward the centroid of its neighbours
+    pts_shifted = pts + (knn_centroids - pts)          # (N, 3)
+
+    # ── Set C_q: DBSCAN on shifted coordinates ───────────────────────────────
+    labels_q = _DBSCAN(
+        eps=cluster_eps, min_samples=cluster_min_points,
+        algorithm='ball_tree', n_jobs=1,
+    ).fit(pts_shifted).labels_
+
+    clusters_q: List[np.ndarray] = [
+        pts[labels_q == lbl]                  # recover original coords, not shifted
+        for lbl in sorted(set(labels_q) - {-1})
+    ]
+
+    # ── Union with IoU deduplication ─────────────────────────────────────────
+    # Build index sets for fast IoU: map each point to its position in pts.
+    # We use a dict from tuple → row index to identify point overlaps.
+    def _cluster_to_set(cluster: np.ndarray) -> set:
+        """Return frozenset of row indices of cluster points in pts."""
+        # Use rounded coordinates as keys (handles float equality)
+        key_map = {tuple(np.round(pts[i], 8)): i for i in range(len(pts))}
+        return frozenset(key_map[tuple(np.round(p, 8))] for p in cluster
+                         if tuple(np.round(p, 8)) in key_map)
+
+    # Build index sets for C_p
+    sets_p = [_cluster_to_set(c) for c in clusters_p]
+
+    result_clusters = list(clusters_p)
+    result_sets     = list(sets_p)
+
+    for c_q, s_q in zip(clusters_q, [_cluster_to_set(c) for c in clusters_q]):
+        duplicate = False
+        for s_kept in result_sets:
+            if len(s_kept) == 0 or len(s_q) == 0:
+                continue
+            inter = len(s_kept & s_q)
+            union = len(s_kept | s_q)
+            if union > 0 and inter / union > iou_dedup_threshold:
+                duplicate = True
+                break
+        if not duplicate:
+            result_clusters.append(c_q)
+            result_sets.append(s_q)
+
+    return result_clusters
 
 
 # ---------------------------------------------------------------------------
@@ -930,3 +1572,154 @@ class TabletopPerception:
         """Convenience wrapper — load a PLY file and run the pipeline."""
         pcd = o3d.io.read_point_cloud(path)
         return self.run(np.asarray(pcd.points))
+
+
+# ---------------------------------------------------------------------------
+# Minimum foreground points threshold (shared by pipeline entry points)
+# ---------------------------------------------------------------------------
+_MIN_FOREGROUND_PTS: int = 50
+
+
+# ---------------------------------------------------------------------------
+# Single-frame pipeline entry point
+# ---------------------------------------------------------------------------
+
+def single_frame_pipeline(
+    depth: np.ndarray,
+    K: np.ndarray,
+    extrinsic: Optional[np.ndarray] = None,
+    fitter: object = 'superdec',
+    timer: Optional[PerceptionTimer] = None,
+) -> Tuple[list, SQWorldModel, dict]:
+    """Full perception pipeline from a single depth frame.
+
+    This is the primary entry point for the Franka Panda deployment — it
+    runs every stage in sequence and returns both the raw fits and a compact
+    world model suitable for downstream planning.
+
+    Pipeline order::
+
+        depth image
+          → pointcloud_from_depth()     Stage 1 — unproject to (N,3) cloud
+          → remove_table()              Stage 2 — RANSAC plane removal
+          → segment_instances_dual()    Stage 3 — PointGroup dual-set DBSCAN
+          → preprocess_pointcloud()     Stage 4a — outlier removal + FPS
+          → fitter.fit_adaptive()       Stage 4b — SQ fitting per segment
+          → postprocess_fits()          Stage 5  — invert preprocessing
+
+    Table removal gracefully falls back to the full cloud when RANSAC fails
+    (e.g., flat surfaces absent in the scene or too few foreground points).
+
+    Parameters
+    ----------
+    depth    : (H, W) float32 depth image in metres; 0 = invalid pixel.
+    K        : (3, 3) camera intrinsic matrix ``[[fx,0,cx],[0,fy,cy],[0,0,1]]``.
+    extrinsic: (4, 4) camera-to-world SE(3) transform.  ``None`` → camera frame.
+    fitter   : ``'superdec'``, ``'lm'``, or a **pre-built fitter instance**.
+               Passing a pre-built instance avoids model-loading overhead on
+               every call (recommended for repeated inference on the robot).
+               When ``'superdec'`` is requested but no GPU / checkpoint is
+               available the function transparently falls back to the LM fitter.
+    timer    : optional :class:`PerceptionTimer`; a fresh one is created if
+               ``None``.
+
+    Returns
+    -------
+    fits        : List[MultiSQFit] — one per detected object, in world frame.
+    world_model : :class:`SQWorldModel` wrapping *fits*.
+    timing_dict : ``{stage_name: elapsed_seconds}`` profiling dict.
+    """
+    if timer is None:
+        timer = PerceptionTimer()
+
+    # ── Stage 1: unproject ────────────────────────────────────────────────────
+    timer.start('unproject')
+    pts = pointcloud_from_depth(depth, K, extrinsic=extrinsic)
+    timer.stop('unproject')
+
+    if len(pts) < _MIN_FOREGROUND_PTS:
+        _log.warning("single_frame_pipeline: only %d valid depth pixels", len(pts))
+        return [], SQWorldModel([]), timer.to_dict()
+
+    # ── Stage 2: table removal (graceful fallback to full cloud) ──────────────
+    timer.start('table')
+    try:
+        obj_pts, _tbl_normal, _tbl_height, _, _ = remove_table(
+            pts.astype(np.float64)
+        )
+        if len(obj_pts) < _MIN_FOREGROUND_PTS:
+            raise ValueError(
+                f"only {len(obj_pts)} foreground pts after table removal"
+            )
+    except Exception as exc:
+        _log.debug(
+            "single_frame_pipeline: table removal failed (%s); using full cloud", exc
+        )
+        obj_pts = pts.astype(np.float64)
+    timer.stop('table')
+
+    # ── Stage 3: dual-set DBSCAN segmentation ────────────────────────────────
+    timer.start('segment')
+    segments = segment_instances_dual(obj_pts, adaptive_eps=True)
+    if not segments:
+        segments = [obj_pts]
+    timer.stop('segment')
+
+    # ── Resolve fitter ────────────────────────────────────────────────────────
+    if isinstance(fitter, str):
+        if fitter == 'lm':
+            from superquadric import SuperquadricFitter as _SQF
+            _fitter = _SQF(n_restarts=3, n_lm_rounds=15, subsample=512)
+            _use_superdec = False
+        else:   # 'superdec' — try GPU path, fall back to LM on failure
+            try:
+                import torch as _torch
+                if not _torch.cuda.is_available():
+                    raise RuntimeError("no CUDA GPU available")
+                from superdec_fitter import SuperdecFitter as _SDF
+                _superdec_dir = os.environ.get(
+                    'SUPERDEC_DIR',
+                    '/work/courses/3dv/team15/superdec',
+                )
+                _ckpt_dir = os.environ.get(
+                    'SUPERDEC_CKPT_DIR',
+                    '/work/courses/3dv/team15/checkpoints/'
+                    'superdec_tabletop/superdec_tabletop_finetune_v2',
+                )
+                _fitter = _SDF(superdec_dir=_superdec_dir,
+                               checkpoint_dir=_ckpt_dir)
+                _use_superdec = True
+            except Exception as exc:
+                _log.warning(
+                    "single_frame_pipeline: SuperDec unavailable (%s); "
+                    "falling back to LM fitter.", exc
+                )
+                from superquadric import SuperquadricFitter as _SQF
+                _fitter = _SQF(n_restarts=3, n_lm_rounds=15, subsample=512)
+                _use_superdec = False
+    else:
+        _fitter = fitter
+        _use_superdec = 'SuperdecFitter' in type(_fitter).__name__
+
+    # ── Stages 4–5: preprocess → fit → postprocess (per segment) ─────────────
+    timer.start('fit')
+    sq_fits_world: list = []
+    for seg_pts in segments:
+        if len(seg_pts) < 20:
+            continue
+        try:
+            pts_pre, _, meta = preprocess_pointcloud(
+                seg_pts.astype(np.float64),
+                for_superdec=_use_superdec,
+            )
+            multi = _fitter.fit_adaptive(pts_pre)
+            # Invert preprocessing so SQ poses are in the same frame as pts.
+            sq_fits_world.extend(postprocess_fits([multi], meta))
+        except Exception as exc:
+            _log.debug(
+                "single_frame_pipeline: segment fit failed (%s); skipping", exc
+            )
+    timer.stop('fit')
+
+    world_model = SQWorldModel(sq_fits_world)
+    return sq_fits_world, world_model, timer.to_dict()
