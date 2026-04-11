@@ -12,12 +12,10 @@ All tests use synthetic point clouds; no dataset files are required.
 """
 
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__),
-                                '../../src/project_3dv/perception'))
 
 import numpy as np
 import pytest
-from pipeline import remove_table, depth_to_pointcloud
+from project_3dv.perception.pipeline import remove_table, depth_to_pointcloud
 
 
 # ---------------------------------------------------------------------------

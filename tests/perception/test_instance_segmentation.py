@@ -12,12 +12,10 @@ Synthetic data design notes
 """
 
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__),
-                                '../../src/project_3dv/perception'))
 
 import numpy as np
 import pytest
-from pipeline import (segment_instances, _split_cluster, _split_cluster_vertical,
+from project_3dv.perception.pipeline import (segment_instances, _split_cluster, _split_cluster_vertical,
                       _split_by_concavity, _split_by_height_layers, classify_shape_hint)
 
 

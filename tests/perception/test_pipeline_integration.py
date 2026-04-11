@@ -11,14 +11,12 @@ No external dataset files or GPU required.
 """
 
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__),
-                                '../../src/project_3dv/perception'))
 
 import numpy as np
 import pytest
-from pipeline import depth_to_pointcloud, TabletopPerception, PerceptionResult
-from superquadric import SuperquadricFitter, SuperquadricFit, MultiSQFit
-from superdec_utils import Scene, sq_fits_to_npz
+from project_3dv.perception.pipeline import depth_to_pointcloud, TabletopPerception, PerceptionResult
+from project_3dv.perception.superquadric import SuperquadricFitter, SuperquadricFit, MultiSQFit
+from project_3dv.perception.superdec_utils import Scene, sq_fits_to_npz
 
 
 # ---------------------------------------------------------------------------

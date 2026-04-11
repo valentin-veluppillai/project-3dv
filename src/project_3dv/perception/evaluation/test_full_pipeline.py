@@ -19,11 +19,9 @@ import time
 import numpy as np
 import open3d as o3d
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-
-from pipeline    import TabletopPerception
-from superquadric import SuperquadricFitter, MultiSQFit
-from superdec_utils import Scene, sq_fits_to_npz
+from project_3dv.perception.pipeline    import TabletopPerception
+from project_3dv.perception.superquadric import SuperquadricFitter, MultiSQFit
+from project_3dv.perception.superdec_utils import Scene, sq_fits_to_npz
 
 # ── paths ────────────────────────────────────────────────────────────────────
 PERCEPTION_DIR   = os.path.dirname(os.path.abspath(__file__))

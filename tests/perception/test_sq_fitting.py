@@ -11,12 +11,10 @@ Tests cover:
 """
 
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__),
-                                '../../src/project_3dv/perception'))
 
 import numpy as np
 import pytest
-from superquadric import (
+from project_3dv.perception.superquadric import (
     SuperquadricFitter, SuperquadricFit, MultiSQFit,
     sq_type_from_exponents, fits_to_curobo_obstacles,
     chamfer_l2, sq_sample_surface, sq_signed_distance_batch,
@@ -299,7 +297,7 @@ class TestFitsToCuroboObstacles:
 # ---------------------------------------------------------------------------
 
 try:
-    from superdec_fitter import (
+    from project_3dv.perception.superdec_fitter import (
         SQ_EXPONENT_CONVEX_MAX, SQ_EXPONENT_MIN, _clamp_exponents,
     )
     _SUPERDEC_FITTER_AVAILABLE = True
