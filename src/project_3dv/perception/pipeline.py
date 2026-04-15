@@ -197,7 +197,10 @@ class SQWorldModel:
         margin : float
             Uniform safety margin inflating every primitive (metres).
         """
-        from superquadric import fits_to_curobo_obstacles
+        try:
+            from .superquadric import fits_to_curobo_obstacles
+        except ImportError:
+            from superquadric import fits_to_curobo_obstacles
         return fits_to_curobo_obstacles(self.all_primitives, margin=margin)
 
 
@@ -498,7 +501,10 @@ def postprocess_fits(
     scale = float(meta["scale"])
     centroid = np.asarray(meta["centroid"], dtype=np.float64)
 
-    from superquadric import MultiSQFit   # lazy — superquadric.py may not be on path at import time
+    try:
+        from .superquadric import MultiSQFit
+    except ImportError:
+        from superquadric import MultiSQFit  # bare-script mode
 
     # Table-frame inversion (applied last — outermost in the transform chain).
     # These keys are only present when preprocess_pointcloud was called with
@@ -1241,6 +1247,70 @@ def segment_instances_dual(
     return result_clusters
 
 
+def merge_nearby_segments(
+    segments: List[np.ndarray],
+    merge_dist: float = 0.15,
+) -> List[np.ndarray]:
+    """Merge segments whose centroids are within *merge_dist* of each other.
+
+    Addresses over-segmentation where DBSCAN splits a single object's point
+    cloud into 2–3 fragments because FPS subsampling leaves spatial gaps within
+    a single object's surface.
+
+    Algorithm
+    ---------
+    1. Compute the centroid of each segment.
+    2. Build a pairwise centroid distance matrix.
+    3. Greedy merge starting from the largest segment: absorb all segments
+       within *merge_dist* of the current segment's centroid, update the
+       centroid, and repeat until no further merges occur.
+    4. Return the merged segment list (largest first).
+
+    Parameters
+    ----------
+    segments   : list of (N_i, 3) point arrays from segment_instances[_dual].
+    merge_dist : centroid-to-centroid distance threshold (metres).
+                 0.15 m works well for tabletop scenes; increase if fragments
+                 of the same object are further apart.
+
+    Returns
+    -------
+    List of (N_i, 3) arrays, merged and sorted largest-first.
+    """
+    if len(segments) <= 1:
+        return list(segments)
+
+    # Sort largest-first so greedy pass starts from the most reliable centroid.
+    order    = sorted(range(len(segments)), key=lambda i: -len(segments[i]))
+    segs     = [segments[i] for i in order]
+    merged   = [False] * len(segs)
+    result: List[np.ndarray] = []
+
+    centroids = np.array([s.mean(axis=0) for s in segs])   # (K, 3)
+
+    for i in range(len(segs)):
+        if merged[i]:
+            continue
+        # Collect all unmerged segments within merge_dist of segment i.
+        group = [i]
+        merged[i] = True
+        # Recompute centroid after each absorption until stable.
+        changed = True
+        while changed:
+            changed = False
+            cur_centroid = np.vstack([segs[j] for j in group]).mean(axis=0)
+            for j in range(len(segs)):
+                if merged[j]:
+                    continue
+                if np.linalg.norm(centroids[j] - cur_centroid) <= merge_dist:
+                    group.append(j)
+                    merged[j] = True
+                    changed    = True
+        result.append(np.vstack([segs[j] for j in group]))
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Stage 4 — Shape classification / SQ hint
 # ---------------------------------------------------------------------------
@@ -1318,7 +1388,10 @@ def fit_superquadrics(
         sd      = scene.get_signed_distance(query_pts)
     """
     if fitter is None:
-        from superquadric import SuperquadricFitter
+        try:
+            from .superquadric import SuperquadricFitter
+        except ImportError:
+            from superquadric import SuperquadricFitter
         fitter = SuperquadricFitter(n_restarts=3, n_lm_rounds=15, subsample=512)
 
     results = []
@@ -1668,7 +1741,10 @@ def single_frame_pipeline(
     # ── Resolve fitter ────────────────────────────────────────────────────────
     if isinstance(fitter, str):
         if fitter == 'lm':
-            from superquadric import SuperquadricFitter as _SQF
+            try:
+                from .superquadric import SuperquadricFitter as _SQF
+            except ImportError:
+                from superquadric import SuperquadricFitter as _SQF
             _fitter = _SQF(n_restarts=3, n_lm_rounds=15, subsample=512)
             _use_superdec = False
         else:   # 'superdec' — try GPU path, fall back to LM on failure
@@ -1694,7 +1770,10 @@ def single_frame_pipeline(
                     "single_frame_pipeline: SuperDec unavailable (%s); "
                     "falling back to LM fitter.", exc
                 )
-                from superquadric import SuperquadricFitter as _SQF
+                try:
+                    from .superquadric import SuperquadricFitter as _SQF
+                except ImportError:
+                    from superquadric import SuperquadricFitter as _SQF
                 _fitter = _SQF(n_restarts=3, n_lm_rounds=15, subsample=512)
                 _use_superdec = False
     else:
