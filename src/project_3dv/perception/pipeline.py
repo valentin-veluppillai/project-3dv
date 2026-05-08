@@ -1802,3 +1802,280 @@ def single_frame_pipeline(
 
     world_model = SQWorldModel(sq_fits_world)
     return sq_fits_world, world_model, timer.to_dict()
+
+
+# ── Two-stage pipeline ────────────────────────────────────────────────────────
+# Stage 1: image(s) → world-frame point cloud
+# Stage 2: world point cloud → superquadrics
+#
+# Set MULTIVIEW = True  to accumulate all frames in Stage 1.
+# Set MULTIVIEW = False to process only the first frame (single-view fallback).
+# Both produce an identical world-frame output contract.
+
+MULTIVIEW: bool = False   # True = all frames; False = first frame only
+
+
+@dataclass
+class Frame:
+    """One RGB-D observation with calibration and pose."""
+    depth:     np.ndarray            # (H, W) float32/float64, metres; 0/nan = invalid
+    K:         np.ndarray            # (3, 3) camera intrinsics [[fx,0,cx],[0,fy,cy],[0,0,1]]
+    rgb:       Optional[np.ndarray] = None   # (H, W, 3) uint8 or float, optional
+    extrinsic: Optional[np.ndarray] = None   # (4, 4) camera-to-world SE(3); None = identity
+
+
+@dataclass
+class SuperquadricWorld:
+    """One fitted superquadric with pose expressed in world frame."""
+    a1:         float          # semi-axis along local x (metres)
+    a2:         float          # semi-axis along local y (metres)
+    a3:         float          # semi-axis along local z (metres)
+    e1:         float          # shape exponent (latitude profile)
+    e2:         float          # shape exponent (longitude cross-section)
+    position:   np.ndarray     # (3,) world-frame translation
+    rotation:   np.ndarray     # (3, 3) world-frame rotation matrix
+    shape_type: str   = "Other"
+    shape_conf: float = 1.0
+    chamfer_l2: float = 0.0
+
+    def quaternion_wxyz(self) -> np.ndarray:
+        """Return rotation as [w, x, y, z] unit quaternion (cuRoBO convention)."""
+        import scipy.spatial.transform as sst
+        return sst.Rotation.from_matrix(self.rotation).as_quat()[[3, 0, 1, 2]]
+
+
+def _unproject_frame(frame: "Frame", max_depth: float) -> np.ndarray:
+    """Back-project one depth frame to world-frame XYZ. Returns (N, 3) float32."""
+    depth = np.asarray(frame.depth, dtype=np.float32)
+    K     = np.asarray(frame.K, dtype=np.float64)
+    H, W  = depth.shape
+
+    u, v  = np.meshgrid(np.arange(W, dtype=np.float32),
+                        np.arange(H, dtype=np.float32))
+    valid = (depth > 0) & np.isfinite(depth) & (depth < max_depth)
+    z     = depth[valid].astype(np.float64)
+    x     = (u[valid] - K[0, 2]) * z / K[0, 0]
+    y     = (v[valid] - K[1, 2]) * z / K[1, 1]
+    pts   = np.stack([x, y, z], axis=1)   # (N, 3) camera frame
+
+    E = np.eye(4, dtype=np.float64) if frame.extrinsic is None \
+        else np.asarray(frame.extrinsic, dtype=np.float64)
+    pts_h = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)
+    return ((E @ pts_h.T).T[:, :3]).astype(np.float32)
+
+
+def _unproject_colors(frame: "Frame", max_depth: float) -> Optional[np.ndarray]:
+    """Return (N, 3) float32 RGB in [0,1] aligned with _unproject_frame output."""
+    if frame.rgb is None:
+        return None
+    depth = np.asarray(frame.depth, dtype=np.float32)
+    valid = (depth > 0) & np.isfinite(depth) & (depth < max_depth)
+    rgb   = np.asarray(frame.rgb, dtype=np.float32)
+    if rgb.max() > 1.5:
+        rgb = rgb / 255.0
+    H, W  = depth.shape
+    return np.clip(rgb.reshape(H * W, 3)[valid.ravel()], 0.0, 1.0)
+
+
+def get_world_pointcloud(
+    frames:     List["Frame"],
+    voxel_size: float = 0.005,
+    max_depth:  float = 3.0,
+) -> o3d.geometry.PointCloud:
+    """Stage 1 — unproject RGB-D frame(s) into a world-frame point cloud.
+
+    Parameters
+    ----------
+    frames      : one or more Frame objects.  When MULTIVIEW=False, only
+                  frames[0] is processed but its extrinsic is still applied —
+                  output is always in world frame regardless of MULTIVIEW.
+    voxel_size  : voxel grid down-sample resolution in metres.  0 = no downsampling.
+    max_depth   : pixels beyond this depth (metres) are discarded.
+
+    Returns
+    -------
+    o3d.geometry.PointCloud with points in world frame.
+    """
+    if not frames:
+        return o3d.geometry.PointCloud()
+
+    active = frames if MULTIVIEW else frames[:1]
+
+    all_pts    = []
+    all_colors = []
+
+    for frame in active:
+        pts    = _unproject_frame(frame, max_depth)
+        colors = _unproject_colors(frame, max_depth)
+        if len(pts) == 0:
+            continue
+        all_pts.append(pts)
+        if colors is not None and len(colors) == len(pts):
+            all_colors.append(colors)
+
+    if not all_pts:
+        return o3d.geometry.PointCloud()
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(
+        np.concatenate(all_pts, axis=0).astype(np.float64))
+
+    has_colors = len(all_colors) == len(all_pts)
+    if has_colors:
+        pcd.colors = o3d.utility.Vector3dVector(
+            np.concatenate(all_colors, axis=0).astype(np.float64))
+
+    if voxel_size > 0:
+        pcd = pcd.voxel_down_sample(voxel_size)
+
+    return pcd
+
+
+def fit_superquadrics_world(
+    world_pcd:          o3d.geometry.PointCloud,
+    fitter              = None,
+    min_object_points:  int   = 50,
+    max_object_points:  int   = 5000,
+    min_object_extent:  float = 0.02,
+    max_object_extent:  float = 0.40,
+    cluster_eps:        float = 0.018,
+    cluster_min_points: int   = 20,
+    adaptive_eps:       bool  = True,
+    min_height:         float = 0.005,
+    max_height:         float = 0.25,
+) -> List["SuperquadricWorld"]:
+    """Stage 2 — segment a world-frame cloud and fit superquadrics.
+
+    Fitting is performed in each segment's centroid-centered local frame.
+    All returned SuperquadricWorld instances carry poses in world frame.
+
+    Parameters
+    ----------
+    world_pcd           : o3d.PointCloud in world frame (Stage 1 output).
+    fitter              : SuperquadricFitter or SuperdecFitter instance.
+                          Defaults to SuperquadricFitter (LM, CPU).
+    min/max_object_*    : cluster size and extent filters.
+    cluster_eps         : DBSCAN neighbourhood radius (metres).
+    cluster_min_points  : DBSCAN min_samples.
+    adaptive_eps        : estimate eps automatically from point density.
+    min/max_height      : foreground height range above fitted table (metres).
+
+    Returns
+    -------
+    List[SuperquadricWorld] — one or more primitives per object, world-frame poses.
+    """
+    try:
+        from .superquadric import SuperquadricFitter
+    except ImportError:
+        from superquadric import SuperquadricFitter
+
+    pts = np.asarray(world_pcd.points, dtype=np.float64)
+    if len(pts) < 50:
+        return []
+
+    # table removal — disable camera-specific filters (depth gate uses camera Z,
+    # XY radius assumes camera at origin; neither is valid for world-frame clouds)
+    try:
+        obj_pts, *_ = remove_table(
+            pts,
+            min_height_above_table = min_height,
+            max_height_above_table = max_height,
+            depth_margin           = np.inf,
+            xy_radius              = np.inf,
+        )
+    except Exception:
+        obj_pts = pts
+
+    if len(obj_pts) < cluster_min_points:
+        return []
+
+    clusters = segment_instances(
+        obj_pts,
+        cluster_eps         = cluster_eps,
+        cluster_min_points  = cluster_min_points,
+        adaptive_eps        = adaptive_eps,
+        eps_multiplier      = 3.0,
+        eps_max             = 0.08,
+    )
+
+    valid_segs = [
+        seg for seg in clusters
+        if (min_object_points <= len(seg) <= max_object_points and
+            min_object_extent <= (seg.max(0) - seg.min(0)).max() <= max_object_extent)
+    ]
+
+    if not valid_segs:
+        return []
+
+    if fitter is None:
+        fitter = SuperquadricFitter(n_restarts=2, n_lm_rounds=10, subsample=256)
+
+    results: List[SuperquadricWorld] = []
+
+    for seg in valid_segs:
+        centroid  = seg.mean(axis=0)
+        local_pts = (seg - centroid).astype(np.float64)
+
+        try:
+            multi = fitter.fit_adaptive(local_pts)
+        except Exception:
+            continue
+
+        for prim in multi.primitives:
+            local_t = np.array([prim.tx, prim.ty, prim.tz], dtype=np.float64)
+            world_t = local_t + centroid
+
+            results.append(SuperquadricWorld(
+                a1         = float(prim.sx),
+                a2         = float(prim.sy),
+                a3         = float(prim.sz),
+                e1         = float(prim.e1),
+                e2         = float(prim.e2),
+                position   = world_t,
+                rotation   = np.array(prim.rotation_matrix, dtype=np.float64),
+                shape_type = prim.shape_type,
+                shape_conf = float(prim.shape_conf),
+                chamfer_l2 = float(prim.chamfer_l2),
+            ))
+
+    return results
+
+
+def superquadrics_to_curobo_world(
+    sqs:          List["SuperquadricWorld"],
+    e1_min:       float = 0.2,
+    e1_max:       float = 1.8,
+    e2_min:       float = 0.2,
+    e2_max:       float = 1.8,
+):
+    """Convert List[SuperquadricWorld] → cuRoBO WorldConfig.
+
+    Parameters
+    ----------
+    sqs             : output of fit_superquadrics_world()
+    e1_min/e1_max   : exponent clamp range ([0.2, 1.8] keeps cuRoBO convex)
+    e2_min/e2_max   : same for e2
+
+    Returns
+    -------
+    curobo.geom.sdf.world.WorldConfig, or raises ImportError if cuRoBO absent.
+    """
+    from curobo.geom.sdf.world import WorldConfig
+    from curobo.geom.types import Superquadric
+
+    obstacles = []
+    for sq in sqs:
+        e1 = float(np.clip(sq.e1, e1_min, e1_max))
+        e2 = float(np.clip(sq.e2, e2_min, e2_max))
+        q  = sq.quaternion_wxyz()   # [w, x, y, z]
+        p  = sq.position
+
+        obstacles.append(Superquadric(
+            pose=[float(p[0]), float(p[1]), float(p[2]),
+                  float(q[0]), float(q[1]), float(q[2]), float(q[3])],
+            scale=[float(sq.a1), float(sq.a2), float(sq.a3)],
+            shape=[e1, e2],
+            name=f"sq_{id(sq)}",
+        ))
+
+    return WorldConfig(superquadric=obstacles)
