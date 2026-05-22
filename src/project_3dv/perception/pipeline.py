@@ -1716,8 +1716,10 @@ def single_frame_pipeline(
 
     # ── Stage 2: table removal (graceful fallback to full cloud) ──────────────
     timer.start('table')
+    tbl_normal: Optional[np.ndarray] = None
+    tbl_height: float = 0.0
     try:
-        obj_pts, _tbl_normal, _tbl_height, _, _ = remove_table(
+        obj_pts, tbl_normal, tbl_height, _, _ = remove_table(
             pts.astype(np.float64)
         )
         if len(obj_pts) < _MIN_FOREGROUND_PTS:
@@ -1729,6 +1731,8 @@ def single_frame_pipeline(
             "single_frame_pipeline: table removal failed (%s); using full cloud", exc
         )
         obj_pts = pts.astype(np.float64)
+        tbl_normal = None
+        tbl_height = 0.0
     timer.stop('table')
 
     # ── Stage 3: dual-set DBSCAN segmentation ────────────────────────────────
@@ -1783,21 +1787,79 @@ def single_frame_pipeline(
     # ── Stages 4–5: preprocess → fit → postprocess (per segment) ─────────────
     timer.start('fit')
     sq_fits_world: list = []
+
+    # SuperDec was trained on ShapeNet (Y-up). The tabletop dataloader rotates
+    # z-up scenes by -90° around X before training; inference must mirror this.
+    # R_z2y: camera frame (z-forward, y-down) → SuperDec canonical (y-up).
+    # R_y2z: inverse, applied to each predicted primitive to restore camera frame.
+    if _use_superdec:
+        import scipy.spatial.transform as _sst
+        _R_z2y = np.array([[1, 0, 0],
+                           [0, 0, 1],
+                           [0,-1, 0]], dtype=np.float64)
+        _R_y2z = _R_z2y.T
+
+    print(f"[sfp-dbg] {len(segments)} segment(s); "
+          f"sizes={[len(s) for s in segments]}")
+
     for seg_pts in segments:
         if len(seg_pts) < 20:
+            print(f"[sfp-dbg] skipping segment with only {len(seg_pts)} pts")
             continue
         try:
+            # Center at the segment centroid so |coord| << 2 for SuperDec's
+            # input contract; centroid is added back after postprocess_fits.
+            centroid = seg_pts.mean(axis=0)
+            pts_centered = seg_pts.astype(np.float64) - centroid
+
             pts_pre, _, meta = preprocess_pointcloud(
-                seg_pts.astype(np.float64),
+                pts_centered,
                 for_superdec=_use_superdec,
+                table_normal=tbl_normal,
+                table_height=tbl_height,
             )
-            multi = _fitter.fit_adaptive(pts_pre)
-            # Invert preprocessing so SQ poses are in the same frame as pts.
-            sq_fits_world.extend(postprocess_fits([multi], meta))
+
+            print(f"[sfp-dbg] seg: {len(seg_pts)} pts → "
+                  f"coord_max={np.abs(pts_pre).max():.3f}  "
+                  f"std={pts_pre.std():.4f}")
+
+            if _use_superdec:
+                pts_in = pts_pre @ _R_z2y.T   # z-up → y-up before SuperDec
+            else:
+                pts_in = pts_pre
+
+            multi = _fitter.fit_adaptive(pts_in)
+
+            if _use_superdec:
+                # Invert y-up → z-up on each predicted primitive pose.
+                for prim in multi.primitives:
+                    t_z = _R_y2z @ np.array([prim.tx, prim.ty, prim.tz])
+                    prim.tx, prim.ty, prim.tz = float(t_z[0]), float(t_z[1]), float(t_z[2])
+                    R_yup = _sst.Rotation.from_euler(
+                        "xyz", [prim.rx, prim.ry, prim.rz]).as_matrix()
+                    rx, ry, rz = _sst.Rotation.from_matrix(
+                        _R_y2z @ R_yup).as_euler("xyz")
+                    prim.rx, prim.ry, prim.rz = float(rx), float(ry), float(rz)
+
+            print(f"[sfp-dbg] {len(multi.primitives)} primitive(s) passed "
+                  f"exist_threshold")
+
+            # Invert preprocessing transforms (scale=1, table rotation, PCA).
+            postprocessed = postprocess_fits([multi], meta)
+            # Re-add centroid that was subtracted before preprocess_pointcloud
+            # (meta['centroid'] is always zeros — centroid is not tracked there).
+            for pp_multi in postprocessed:
+                for prim in pp_multi.primitives:
+                    prim.tx += float(centroid[0])
+                    prim.ty += float(centroid[1])
+                    prim.tz += float(centroid[2])
+            sq_fits_world.extend(postprocessed)
+
         except Exception as exc:
             _log.debug(
                 "single_frame_pipeline: segment fit failed (%s); skipping", exc
             )
+            print(f"[sfp-dbg] segment fit raised: {exc}")
     timer.stop('fit')
 
     world_model = SQWorldModel(sq_fits_world)

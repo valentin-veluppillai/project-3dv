@@ -39,6 +39,15 @@ Grasp planning
 """
 
 from .pipeline import (
+    Frame,
+    SuperquadricWorld,
+    get_world_pointcloud,
+    fit_superquadrics_world,
+    superquadrics_to_curobo_world,
+    MULTIVIEW,
+)
+
+from .pipeline import (
     depth_to_pointcloud,
     pointcloud_from_depth,
     remove_table,
@@ -78,6 +87,13 @@ except ImportError:
     SuperdecFitter = None  # type: ignore[assignment,misc]
 
 __all__ = [
+    # two-stage pipeline
+    "Frame",
+    "SuperquadricWorld",
+    "get_world_pointcloud",
+    "fit_superquadrics_world",
+    "superquadrics_to_curobo_world",
+    "MULTIVIEW",
     # pipeline stages
     "depth_to_pointcloud",
     "pointcloud_from_depth",
