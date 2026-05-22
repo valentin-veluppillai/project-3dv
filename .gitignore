@@ -179,3 +179,4 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 scripts/node_wrapper_check.py
+scripts/node_wrapper_check.py

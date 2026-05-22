@@ -1815,8 +1815,6 @@ def single_frame_pipeline(
             pts_pre, _, meta = preprocess_pointcloud(
                 pts_centered,
                 for_superdec=_use_superdec,
-                table_normal=tbl_normal,
-                table_height=tbl_height,
             )
 
             print(f"[sfp-dbg] seg: {len(seg_pts)} pts → "
