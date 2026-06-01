@@ -668,7 +668,7 @@ class SuperdecFitter:
         rotations   = out['rotate'][0].cpu().numpy()      # (16, 3, 3)
         translations= out['trans'][0].cpu().numpy()       # (16, 3)
         exponents   = out['shape'][0].cpu().numpy()       # (16, 2)
-        exist_score = out['exist'][0].cpu().numpy()       # (16,)  or sigmoid needed
+        exist_score = out['exist'][0].cpu().numpy().ravel()  # (N,) regardless of trailing dims
 
         # exist may be raw logits — apply sigmoid if range is not [0,1]
         if exist_score.min() < -0.5 or exist_score.max() > 1.5:
@@ -750,6 +750,7 @@ class SuperdecFitter:
         trans_out   = out['trans'].cpu().numpy()
         exponents   = out['shape'].cpu().numpy()
         exist_score = out['exist'].cpu().numpy()
+        exist_score = exist_score.reshape(exist_score.shape[0], -1)  # (B, N) — drop trailing dim
         assign      = raw_out.get('assign_matrix')
 
         if exist_score.min() < -0.5 or exist_score.max() > 1.5:
